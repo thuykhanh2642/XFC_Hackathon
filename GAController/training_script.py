@@ -1,4 +1,4 @@
-# GA Training Script — GAFuzzyController (parallel evaluation)
+# GA Training Script — HybridGA (parallel evaluation)
 
 import sys
 sys.path.append('.')

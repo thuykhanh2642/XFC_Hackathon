@@ -7,8 +7,8 @@ sys.path.append('.')
 
 from pathlib import Path
 from kesslergame import KesslerGame, GraphicsType
-from GAController import GAFuzzyController
-from Scenarios.example_scenarios import training_set
+from HybridController2 import GAFuzzyController
+from scenarios import training_set
 
 #Load best solution
 json_path = Path(os.path.dirname(__file__), "best_solution.json")

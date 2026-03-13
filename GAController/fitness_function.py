@@ -13,7 +13,7 @@ import sys
 sys.path.append('.')
 
 from kesslergame import KesslerGame, GraphicsType
-from GAController import GAFuzzyController
+from GAController1 import GAFuzzyController
 from scenarios import training_set
 
 

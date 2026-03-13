@@ -399,4 +399,4 @@ class GAFuzzyController(KesslerController):
 
     @property
     def name(self) -> str:
-        return "GA Fuzzy Controller"
+        return "GAFuzzy Controller"
