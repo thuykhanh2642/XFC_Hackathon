@@ -25,7 +25,7 @@ scenario_list = [
     donut_ring(),
     four_corner(),
     stock_scenario(),
-    vertical_wall_left(),
+    vertical_wall_left(),   
     donut_ring_closing(),
     asteroid_rain(),
     moving_maze_right(),
