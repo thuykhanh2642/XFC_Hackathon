@@ -1,0 +1,10 @@
+numpy
+joblib
+matplotlib
+pandas
+openpyxl
+scikit-fuzzy
+scipy
+deap
+networkx
+kesslergame
