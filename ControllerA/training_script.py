@@ -1,139 +1,145 @@
-# GA Training Script — GAFuzzyController
-# Drop-in replacement for example_fuzzy_training_script.py.
-# Run this from the project root:   python training_script.py
+# compare_controllers.py
+# Runs multiple controllers against the same scenarios and prints a
+# side-by-side comparison table.
 #
-# Chromosome: 50 floats in [0.0, 1.0]
-# Encoding breakdown -> see GAcontroller.py header comment.
+# Usage:  python compare_controllers.py
 
-import sys
+import sys, os, json, time
 sys.path.append('.')
 
-import json
-import os
-import random
 from pathlib import Path
+from kesslergame import KesslerGame, GraphicsType
+from scenarios import training_set
 
-from deap import base, creator, tools
-
-from fitness_function import Fitness
-
-
-#Helpers
-
-def clear_solution_history(output_dir: Path):
-    if not output_dir.exists():
-        return
-    for p in output_dir.glob("gen_*.json"):
-        p.unlink()
+# ── Import whichever controllers you want to compare ─────────────────────────
+from GAController import GAFuzzyController
+from example_controller_fuzzy import MyFuzzyController   # baseline
 
 
-def save_best(individual, generation, out_dir, pop_size, cxpb, mutpb):
-    result = {
-        "generation":     generation,
-        "fitness":        list(individual.fitness.values),
-        "genome":         list(individual),
-        "n_genes":        len(individual),
-        "population_size": pop_size,
-        "cxpb":           cxpb,
-        "mutpb":          mutpb,
-    }
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"gen_{generation:04d}.json"
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-    # Always overwrite the "best so far" convenience file
-    best_path = out_dir.parent / "best_solution.json"
-    with best_path.open("w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Config — add/remove entries here to compare different controllers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_genome(path):
+    p = Path(path)
+    if not p.exists():
+        print(f"  [warn] {path} not found — using default chromosome")
+        return None
+    with p.open() as f:
+        return [float(x) for x in json.load(f)["genome"]]
+
+CONTROLLERS = [
+    ("Baseline (no genome)",  MyFuzzyController,   None),
+    ("GA Controller (trained)", GAFuzzyController, load_genome("best_solution.json")),
+]
+
+GAME_SETTINGS = {
+    'perf_tracker':          False,
+    'graphics_type':         GraphicsType.NoGraphics,
+    'realtime_multiplier':   0,
+    'graphics_obj':          None,
+    'frequency':             30,
+    'time_limit':            60,
+    'competition_safe_mode': False,
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_controller(name, controller_cls, genome):
+    """Run one controller across all scenarios, return per-scenario stats."""
+    ctrl = controller_cls(chromosome=genome) if genome is not None else controller_cls()
+    game = KesslerGame(settings=GAME_SETTINGS)
+
+    results = []
+    for scenario in training_set:
+        t0 = time.perf_counter()
+        result, _ = game.run(scenario=scenario, controllers=[ctrl])
+        elapsed = time.perf_counter() - t0
+        t = result.teams[0]
+        results.append({
+            "scenario":   scenario.name,
+            "hit":        t.asteroids_hit,
+            "frac":       t.fraction_total_asteroids_hit,
+            "accuracy":   t.accuracy,
+            "deaths":     t.deaths,
+            "score":      t.fraction_total_asteroids_hit * 2.0 + t.accuracy - t.deaths * 0.5,
+            "time":       elapsed,
+        })
+    return results
 
 
-#GA setup
+def print_comparison(all_results):
+    names    = [r[0] for r in all_results]
+    results  = [r[1] for r in all_results]
+    scenarios = [r["scenario"] for r in results[0]]
 
-N_GENES      = 50
-POP_SIZE     = 20
-MAX_GEN      = 1000
-CXPB         = 0.5
-MUTPB        = 0.2
-SIGMA        = 0.15   # slightly tighter Gaussian mutation than baseline
-INDPB        = 0.05   # per-gene mutation probability
+    col_w = 22
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    print()
+    print("=" * (18 + col_w * len(names)))
+    print("  CONTROLLER COMPARISON")
+    print("=" * (18 + col_w * len(names)))
+    header = f"  {'Scenario':<16}"
+    for n in names:
+        header += f"  {n[:col_w-2]:^{col_w}}"
+    print(header)
+    print(f"  {'':16}  " + "  ".join([f"{'frac':>5} {'acc':>5} {'die':>3} {'score':>6}"] * len(names)))
+    print("-" * (18 + col_w * len(names)))
+
+    # ── Per-scenario rows ─────────────────────────────────────────────────────
+    totals = [[0.0, 0.0, 0, 0.0] for _ in names]   # frac, acc, deaths, score
+
+    for i, scenario_name in enumerate(scenarios):
+        row = f"  {scenario_name:<16}"
+        for ci, res in enumerate(results):
+            r = res[i]
+            row += (f"  {r['frac']:5.2f} {r['accuracy']:5.2f} "
+                    f"{r['deaths']:3d} {r['score']:6.3f}")
+            totals[ci][0] += r['frac']
+            totals[ci][1] += r['accuracy']
+            totals[ci][2] += r['deaths']
+            totals[ci][3] += r['score']
+        print(row)
+
+    # ── Totals ────────────────────────────────────────────────────────────────
+    print("-" * (18 + col_w * len(names)))
+    n_s = len(scenarios)
+    row = f"  {'AVERAGE':<16}"
+    for ci in range(len(names)):
+        row += (f"  {totals[ci][0]/n_s:5.2f} {totals[ci][1]/n_s:5.2f} "
+                f"{totals[ci][2]/n_s:5.1f} {totals[ci][3]/n_s:6.3f}")
+    print(row)
+
+    row = f"  {'TOTAL SCORE':<16}"
+    for ci in range(len(names)):
+        row += f"  {'':>5} {'':>5} {'':>3} {totals[ci][3]:6.3f}"
+    print(row)
+    print("=" * (18 + col_w * len(names)))
+
+    # ── Winner ───────────────────────────────────────────────────────────────
+    scores = [t[3] for t in totals]
+    best   = scores.index(max(scores))
+    print(f"\n  Winner: {names[best]}  (total score {scores[best]:.3f})")
+    if len(names) == 2:
+        delta = scores[best] - scores[1 - best]
+        pct   = delta / max(abs(scores[1 - best]), 1e-6) * 100
+        print(f"  Margin: +{delta:.3f}  ({pct:+.1f}%)")
+    print()
 
 
 def main():
-    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-    creator.create("Individual", list, fitness=creator.FitnessMax)
+    all_results = []
+    for name, cls, genome in CONTROLLERS:
+        print(f"Evaluating: {name} ...")
+        t0  = time.perf_counter()
+        res = evaluate_controller(name, cls, genome)
+        elapsed = time.perf_counter() - t0
+        total_score = sum(r["score"] for r in res)
+        print(f"  Done in {elapsed:.1f}s — total score {total_score:.3f}")
+        all_results.append((name, res))
 
-    toolbox = base.Toolbox()
-    toolbox.register("attr_flt",  random.uniform, 0.0, 1.0)
-    toolbox.register("individual", tools.initRepeat,
-                     creator.Individual, toolbox.attr_flt, N_GENES)
-    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-
-    toolbox.register("evaluate", Fitness)
-    toolbox.register("mate",     tools.cxTwoPoint)
-    toolbox.register("mutate",   tools.mutGaussian,
-                     mu=0.0, sigma=SIGMA, indpb=INDPB)
-    toolbox.register("select",   tools.selTournament, tournsize=3)
-
-    #initialise population
-    pop = toolbox.population(n=POP_SIZE)
-
-    out_dir = Path(os.path.dirname(__file__), "solution_history")
-    clear_solution_history(out_dir)
-
-    print(f"Evaluating initial population ({POP_SIZE} individuals) …")
-    fitnesses = list(map(toolbox.evaluate, pop))
-    for ind, fit in zip(pop, fitnesses):
-        ind.fitness.values = fit
-
-    hof = tools.HallOfFame(1)
-    hof.update(pop)
-    save_best(hof[0], 0, out_dir, POP_SIZE, CXPB, MUTPB)
-
-    fits = [ind.fitness.values[0] for ind in pop]
-    print(f"Gen 0 — max={max(fits):.4f}  mean={sum(fits)/len(fits):.4f}")
-
-    #evolution loop
-    for g in range(1, MAX_GEN + 1):
-        offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
-
-        # crossover
-        for c1, c2 in zip(offspring[::2], offspring[1::2]):
-            if random.random() < CXPB:
-                toolbox.mate(c1, c2)
-                del c1.fitness.values, c2.fitness.values
-
-        # mutation + clamp to [0, 1]
-        for mutant in offspring:
-            if random.random() < MUTPB:
-                toolbox.mutate(mutant)
-                for i in range(len(mutant)):
-                    mutant[i] = float(min(max(mutant[i], 0.0), 1.0))
-                del mutant.fitness.values
-
-        # evaluate stale individuals
-        invalid = [ind for ind in offspring if not ind.fitness.valid]
-        for ind, fit in zip(invalid, map(toolbox.evaluate, invalid)):
-            ind.fitness.values = fit
-
-        pop[:] = offspring
-        hof.update(pop)
-        save_best(hof[0], g, out_dir, POP_SIZE, CXPB, MUTPB)
-
-        fits  = [ind.fitness.values[0] for ind in pop]
-        mean  = sum(fits) / len(fits)
-        std   = (sum(x**2 for x in fits) / len(fits) - mean**2) ** 0.5
-
-        print(
-            f"Gen {g:4d} — "
-            f"best={hof[0].fitness.values[0]:.4f}  "
-            f"max={max(fits):.4f}  mean={mean:.4f}  std={std:.4f}"
-        )
-
-    print("\n── Training complete ──")
-    print(f"Best fitness : {hof[0].fitness.values[0]:.4f}")
-    print(f"Best genome  : {list(hof[0])}")
-    print(f"Checkpoints  : {out_dir.resolve()}")
-    print(f"Best solution: {(out_dir.parent / 'best_solution.json').resolve()}")
+    print_comparison(all_results)
 
 
 if __name__ == "__main__":
