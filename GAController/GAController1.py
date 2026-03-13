@@ -1,16 +1,11 @@
 # Fuzzy GA Controller
 #
-# Key improvements over the baseline controllers:
-#   1. LEAD AIMING   - analytically computes the intercept point so bullets
-#                      meet the asteroid rather than chasing where it WAS.
-#   2. THREAT-BASED TARGET SELECTION - FIS scores every nearby asteroid on
-#                      TTI + size; ship targets the most dangerous, not nearest.
-#   3. EVASION THRUST - a separate FIS decides when / how hard to thrust
+#NOTE
+#   1. LEAD AIMING: analytically computes the intercept point
+#   2. THREAT-BASED TARGET SELECTION - FIS scores every nearby asteroid on ttc + size; ship targets the most dangerous, not nearest.
+#   3. EVASION THRUST: a separate FIS decides when / how hard to thrust
 #                      based on incoming threat TTI and approach geometry.
-#   4. FULLY GA-TUNABLE - membership-function breakpoints, rule tables, fire
-#                      threshold, evasion sensitivity, and thrust scale are
-#                      all encoded in the 50-gene chromosome.
-#
+#   4. FULLY GA-TUNABLE:embership-function breakpoints, rule tables, fire threshold, evasion sensitivity, and thrust scale are all encoded in the 50-gene chromosome.
 # 
 # CHROMOSOME LAYOUT  (50 genes, each a float in [0.0, 1.0])
 # 
@@ -39,7 +34,6 @@
 #   [39] thrust_scale          → linear map to [0.2, 1.0]
 #   [40] mine_tti_threshold    → linear map to [0.0, 3.0] s  (0 = never)
 #   [41–49] padding / future use
-# 
 
 from kesslergame import KesslerController
 from typing import Dict, Tuple
@@ -50,9 +44,9 @@ import skfuzzy as skf
 import numpy as np
 import math
 
-BULLET_SPEED = 800.0   # px/s  (approximate Kessler bullet speed)
-MAX_THRUST   = 480.0   # px/s² (Kessler thrust limit)
-MAX_TURN     = 180.0   # deg/s (Kessler turn-rate limit)
+BULLET_SPEED = 800.0   # px/s
+MAX_THRUST   = 480.0   # px/s²
+MAX_TURN     = 180.0   # deg/s
 
 
 # 
