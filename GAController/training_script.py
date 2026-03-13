@@ -10,6 +10,7 @@ import time
 import multiprocessing
 from datetime import timedelta
 from pathlib import Path
+from scenarios import training_set
 
 from deap import base, creator, tools
 from fitness_function import Fitness
@@ -69,7 +70,6 @@ N_WORKERS = max(1, multiprocessing.cpu_count() - 1)
 
 
 def main():
-    from scenarios import training_set
     n_scenarios = len(training_set)
 
     #DEAP setup
