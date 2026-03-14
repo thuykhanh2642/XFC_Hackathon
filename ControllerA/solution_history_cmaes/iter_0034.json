@@ -1,9 +1,10 @@
 {
-  "generation": 106,
-  "fitness": [
-    -1.5570647773279351
-  ],
+  "method": "CMA-ES",
+  "iteration": 34,
+  "train_score": -2.0547250337381913,
   "validation_score": -2.6752474853577795,
+  "validation_details": null,
+  "sigma": 0.0879598952403843,
   "genome": [
     0.26839553804922534,
     0.8517131600193318,
@@ -57,8 +58,6 @@
     0.7292506339486988
   ],
   "n_genes": 50,
-  "population_size": 20,
-  "cxpb": 0.5,
-  "mutpb": 0.2,
-  "sigma": 0.2
+  "train_scenarios": 12,
+  "validation_scenarios": 4
 }
