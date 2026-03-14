@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # Fitness function for SuperiorFuzzyController
 #
-# Score per scenario = fraction_asteroids_hit + accuracy
-# (same metric as the baseline so results are directly comparable)
+# Score per scenario matches training_script.py
+# (hit + accuracy reward, death/mine penalties, clean-run bonus)
 #
 # Usage: drop this file next to example_fitness_function.py
 
@@ -10,7 +10,7 @@ import sys
 sys.path.append('.')
 
 from kesslergame import KesslerGame, GraphicsType
-from GAController import GAFuzzyController
+from HybridController2 import GAFuzzyController
 from scenarios import training_set
 
 
@@ -31,11 +31,20 @@ def Fitness(individual, settings=None):
 
     for scenario in training_set:
         result, _ = game.run(scenario=scenario, controllers=[controller])
-        score = (result.teams[0].fraction_total_asteroids_hit
-                 + result.teams[0].accuracy)
+        t = result.teams[0]
+        mines_used = float(getattr(t, "mines_used", 0.0) or 0.0)
+        score = (
+            1.5 * float(t.fraction_total_asteroids_hit)
+            + 0.35 * float(t.accuracy)
+            - 0.75 * float(t.deaths)
+            - 0.05 * mines_used
+        )
+        if int(t.deaths) == 0:
+            score += 0.5
         total_score += score
 
     return total_score,
+
 
 
 if __name__ == "__main__":

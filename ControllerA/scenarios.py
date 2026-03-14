@@ -650,11 +650,106 @@ def four_corner(map_size=(1200, 900), *,
     )
 
 
+
+
+
+def one_asteroid_still(map_size=(1000, 800), *, time_limit=20):
+    W, H = map_size
+    ship = _mk_ship(pos=(W*0.25, H*0.5), angle=0)
+
+    asteroids = [{
+        "position": (W*0.75, H*0.5),
+        "size": 3,
+        "angle": 0.0,
+        "speed": 0.0
+    }]
+
+    return Scenario(
+        name="One Asteroid Still",
+        map_size=map_size,
+        num_asteroids=0,
+        asteroid_states=asteroids,
+        ship_states=[ship],
+        time_limit=time_limit,
+        ammo_limit_multiplier=0,
+        stop_if_no_ammo=False
+    )
+
+
+def one_asteroid_slow_horizontal(map_size=(1000,800), *, speed=60, time_limit=25):
+    W,H = map_size
+    ship = _mk_ship(pos=(W*0.25, H*0.5), angle=0)
+
+    asteroids = [{
+        "position": (W*0.75, H*0.5),
+        "size": 3,
+        "angle": 180.0,
+        "speed": speed
+    }]
+
+    return Scenario(
+        name="One Asteroid Slow Horizontal",
+        map_size=map_size,
+        num_asteroids=0,
+        asteroid_states=asteroids,
+        ship_states=[ship],
+        time_limit=time_limit,
+        ammo_limit_multiplier=0,
+        stop_if_no_ammo=False
+    )
+
+
+def two_asteroids_still(map_size=(1000,800), *, time_limit=25):
+    W,H = map_size
+    ship = _mk_ship(pos=(W*0.25, H*0.5), angle=0)
+
+    asteroids = [
+        {"position": (W*0.7, H*0.4), "size":3, "angle":0.0, "speed":0.0},
+        {"position": (W*0.7, H*0.6), "size":3, "angle":0.0, "speed":0.0},
+    ]
+
+    return Scenario(
+        name="Two Asteroids Still",
+        map_size=map_size,
+        num_asteroids=0,
+        asteroid_states=asteroids,
+        ship_states=[ship],
+        time_limit=time_limit,
+        ammo_limit_multiplier=0,
+        stop_if_no_ammo=False
+    )
+
+
+def three_asteroids_still_row(map_size=(1000,800), *, time_limit=25):
+    W,H = map_size
+    ship = _mk_ship(pos=(W*0.25, H*0.5), angle=0)
+
+    asteroids = [
+        {"position": (W*0.7, H*0.35), "size":3, "angle":0.0, "speed":0.0},
+        {"position": (W*0.7, H*0.5), "size":3, "angle":0.0, "speed":0.0},
+        {"position": (W*0.7, H*0.65), "size":3, "angle":0.0, "speed":0.0},
+    ]
+
+    return Scenario(
+        name="Three Asteroids Row",
+        map_size=map_size,
+        num_asteroids=0,
+        asteroid_states=asteroids,
+        ship_states=[ship],
+        time_limit=time_limit,
+        ammo_limit_multiplier=0,
+        stop_if_no_ammo=False
+    )
+
 # Training set — used by fitness_function.py
 # A diverse mix that forces the GA to generalise:
 #   static targets, fast movers, closing rings, crossing traffic
 
 training_set = [
+    one_asteroid_still(),
+    one_asteroid_slow_horizontal(),
+    two_asteroids_still(),
+    three_asteroids_still_row(),
     stock_scenario(),
     donut_ring(),
     donut_ring_closing(),
@@ -662,4 +757,12 @@ training_set = [
     asteroid_rain(),
     crossing_lanes(),
     giants_with_kamikaze(),
+    spiral_arms(),
+]
+
+validation_set = [
+    moving_maze_right(),
+    four_corner(),
+    rotating_cross(),
+    sniper_practice(),
 ]
