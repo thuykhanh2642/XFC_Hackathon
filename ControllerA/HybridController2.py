@@ -1,29 +1,3 @@
-# GA Fuzzy Controller — Hybrid Architecture
-#
-# CHROMOSOME LAYOUT  (50 genes, each a float in [0.0, 1.0])
-#
-#  FIS 1 — Aiming  (angle_error x bullet_time -> turn_rate)
-#   [0]  angle_error MF breakpoint   (maps [-1,  1] universe)
-#   [1]  bullet_time MF breakpoint   (maps [ 0,  1] universe)
-#   [2]  turn_rate   MF breakpoint   (maps [-1,  1] universe)
-#   [3-11] 9 rule consequent labels  (3x3 table)
-#
-#  FIS 2 — Target Priority  (norm_tti x norm_size -> priority)
-#   [12] norm_tti  MF breakpoint     (maps [0, 1] universe)
-#   [13] norm_size MF breakpoint     (maps [0, 1] universe)
-#   [14] priority  MF breakpoint     (maps [0, 1] universe)
-#   [15-23] 9 rule consequent labels
-#
-#  Scalar parameters
-#   [24] fire_threshold_deg   -> [0,  15] deg
-#   [25] n_candidates         -> bins to {3, 5, 7, 10}
-#   [26] evasion_tti_hard     -> [0.3, 3.0] s  (full dodge below this TTI)
-#   [27] evasion_tti_soft     -> [1.0, 6.0] s  (partial dodge below this TTI)
-#   [28] thrust_hard_frac     -> [0.6, 1.0] x MAX_THRUST
-#   [29] thrust_soft_frac     -> [0.1, 0.5] x MAX_THRUST
-#   [30] mine_tti_threshold   -> [0.0, 3.0] s  (0 = never deploy)
-#   [31-49] padding
-
 from kesslergame import KesslerController
 from typing import Dict, Tuple
 from sa.sa import SA
@@ -36,6 +10,7 @@ import math
 BULLET_SPEED = 800.0
 MAX_THRUST   = 480.0
 MAX_TURN     = 180.0
+TARGET_LOCK_FRAMES = 12
 
 
 def _compute_intercept(ship_pos, ast_pos_wrap, ast_vel):
@@ -75,28 +50,51 @@ def _compute_intercept(ship_pos, ast_pos_wrap, ast_vel):
     )
 
 
-def _geometric_dodge_thrust(ship_heading_deg, threat_ast, thrust_magnitude):
+def _safe_unit(x, y):
+    n = math.sqrt(x * x + y * y)
+    if n < 1e-8:
+        return 0.0, 0.0
+    return x / n, y / n
+
+
+def _learned_dodge_thrust(ship_heading_deg, ship_pos, threat_ast, thrust_magnitude, chromosome):
     """
-    Thrust perpendicular to the asteroid's velocity vector.
-    Always geometrically correct — no training required.
+    Blend between:
+      - perpendicular-to-velocity dodge
+      - radial escape from asteroid
+      - mild forward bias
+    Then choose thrust sign based on ship heading.
     """
-    vx = threat_ast.velocity[0]
-    vy = threat_ast.velocity[1]
-    speed = math.sqrt(vx**2 + vy**2)
-    if speed < 1e-6:
+    vx, vy = threat_ast.velocity
+    ax, ay = threat_ast.position_wrap
+
+    vel_u = _safe_unit(vx, vy)
+    if abs(vel_u[0]) < 1e-8 and abs(vel_u[1]) < 1e-8:
         return thrust_magnitude
 
-    perp1 = (-vy / speed, vx / speed)
-    perp2 = (vy / speed, -vx / speed)
+    perp1 = (-vel_u[1], vel_u[0])
+    perp2 = (vel_u[1], -vel_u[0])
+
+    away_u = _safe_unit(ship_pos[0] - ax, ship_pos[1] - ay)
 
     h_rad = math.radians(ship_heading_deg)
-    ship_dir = (math.sin(h_rad), -math.cos(h_rad))
+    ship_fwd = (math.sin(h_rad), -math.cos(h_rad))
 
-    dot1 = ship_dir[0] * perp1[0] + ship_dir[1] * perp1[1]
-    dot2 = ship_dir[0] * perp2[0] + ship_dir[1] * perp2[1]
+    # genes 32..34 control direction blend
+    w_perp = 0.25 + chromosome[32] * 1.25
+    w_away = chromosome[33] * 1.25
+    w_fwd  = (chromosome[34] - 0.5) * 0.8
 
-    best_dot = dot1 if abs(dot1) >= abs(dot2) else dot2
-    return math.copysign(thrust_magnitude, best_dot)
+    def blended_score(perp):
+        bx = w_perp * perp[0] + w_away * away_u[0] + w_fwd * ship_fwd[0]
+        by = w_perp * perp[1] + w_away * away_u[1] + w_fwd * ship_fwd[1]
+        bu = _safe_unit(bx, by)
+        return ship_fwd[0] * bu[0] + ship_fwd[1] * bu[1]
+
+    s1 = blended_score(perp1)
+    s2 = blended_score(perp2)
+    best = s1 if abs(s1) >= abs(s2) else s2
+    return math.copysign(thrust_magnitude, best)
 
 
 def _build_fis_2input(c, in1_name, in1_range, bp1_idx, in1_labels,
@@ -155,13 +153,7 @@ def _safe_compute(sim, inputs, output_key, fallback):
 
 
 class GAFuzzyController(KesslerController):
-    """
-    Hybrid: GA-tuned fuzzy aiming + deterministic geometric evasion.
-
-    The GA tunes WHEN to dodge and how aggressively (thresholds + magnitudes).
-    The dodge direction is always geometrically correct — perpendicular to the
-    incoming asteroid's velocity. No training needed for basic survival.
-    """
+    """Hybrid fuzzy aiming + learned dodge gating, with target lock for stable aim."""
 
     _DEFAULT_CHROM = [
         0.5, 0.5, 0.5,
@@ -187,6 +179,8 @@ class GAFuzzyController(KesslerController):
         self.chromosome = chromosome if chromosome is not None else list(self._DEFAULT_CHROM)
         self.sa = SA()
         self._build_fis_systems()
+        self._target_lock = None
+        self._target_lock_timer = 0
 
     def _build_fis_systems(self):
         c = self.chromosome
@@ -207,7 +201,7 @@ class GAFuzzyController(KesslerController):
 
     @property
     def _fire_threshold(self):
-        return self.chromosome[24] * 15.0
+        return max(2.0, self.chromosome[24] * 15.0)
 
     @property
     def _n_candidates(self):
@@ -233,43 +227,49 @@ class GAFuzzyController(KesslerController):
     def _mine_tti_threshold(self):
         return self.chromosome[30] * 3.0
 
+    @property
+    def _aim_lock_angle_deg(self):
+        return 1.0 + self.chromosome[31] * 11.0
+
+    @property
+    def _closing_gate_soft(self):
+        return 0.05 + self.chromosome[35] * 0.80
+
+    @property
+    def _closing_gate_hard(self):
+        return self.chromosome[36] * 0.60
+
+    @property
+    def _size_bias(self):
+        return self.chromosome[37] * 0.50
+
+    @property
+    def _aim_lock_soft_suppression(self):
+        return self.chromosome[38]
+
     def should_drop_mine(self, closest_tti, impacters, fire_ready):
-        """More conservative mine use: only spend mines when danger is real."""
         if self._mine_tti_threshold <= 0 or closest_tti is None:
             return False
-
         if closest_tti > self._evasion_tti_hard * 0.7:
             return False
-
         if closest_tti < self._mine_tti_threshold * 0.5:
             return True
 
         imminent_count = sum(
-            1
-            for ast in impacters
+            1 for ast in impacters
             if getattr(ast, "tti", None) is not None and ast.tti < self._mine_tti_threshold
         )
         if imminent_count >= 2:
             return True
-
         if not fire_ready and closest_tti < self._mine_tti_threshold:
             return True
-
         return False
 
-    def actions(self, ship_state: Dict, game_state: Dict) -> Tuple[float, float, bool, bool]:
-        self.sa.update(ship_state, game_state)
-
-        if not self.sa.ownship.asteroids:
-            return 0.0, 0.0, False, False
-
-        tti_hard = self._evasion_tti_hard
-        tti_soft = self._evasion_tti_soft
-        tti_cap = max(tti_soft, 6.0)
-
-        impacters = self.sa.ownship.soonest_impact_n(3)
-        dodge_threat = impacters[0] if impacters else None
-        closest_tti = dodge_threat.tti if dodge_threat is not None else None
+    def _pick_target(self, tti_cap):
+        # Keep current target briefly to avoid wrap/intercept jitter.
+        if self._target_lock_timer > 0 and self._target_lock is not None:
+            self._target_lock_timer -= 1
+            return self._target_lock
 
         n = min(self._n_candidates, len(self.sa.ownship.asteroids))
         candidates = self.sa.ownship.nearest_n_wrap(n)
@@ -289,6 +289,28 @@ class GAFuzzyController(KesslerController):
             if p > best_priority:
                 best_priority = p
                 best_target = ast
+
+        self._target_lock = best_target
+        self._target_lock_timer = TARGET_LOCK_FRAMES
+        return best_target
+
+    def actions(self, ship_state: Dict, game_state: Dict) -> Tuple[float, float, bool, bool]:
+        self.sa.update(ship_state, game_state)
+
+        if not self.sa.ownship.asteroids:
+            self._target_lock = None
+            self._target_lock_timer = 0
+            return 0.0, 0.0, False, False
+
+        tti_hard = self._evasion_tti_hard
+        tti_soft = self._evasion_tti_soft
+        tti_cap = max(tti_soft, 6.0)
+
+        impacters = self.sa.ownship.soonest_impact_n(3)
+        dodge_threat = impacters[0] if impacters else None
+        closest_tti = dodge_threat.tti if dodge_threat is not None else None
+
+        best_target = self._pick_target(tti_cap)
 
         intercept = _compute_intercept(
             self.sa.ownship.position,
@@ -316,26 +338,107 @@ class GAFuzzyController(KesslerController):
         )
         turn_rate = float(np.clip(norm_turn * MAX_TURN, -MAX_TURN, MAX_TURN))
 
+        abs_err = abs(angle_error)
+        if abs_err > 8.0 and turn_rate * angle_error < 0:
+            turn_rate = float(np.sign(angle_error)) * min(abs_err * 2.0, MAX_TURN)
+
+        if abs_err > 0.1:
+            max_rate_for_error = abs_err * 0.70 * 30.0   # 70% of error per frame × fps
+            turn_rate = float(np.clip(turn_rate, -max_rate_for_error, max_rate_for_error))
+
+        # Wider settle zone to avoid micro-oscillation.
+        settle_zone = max(2.5, 0.45 * self._fire_threshold)
+        if abs_err < settle_zone:
+            turn_rate = 0.0
+
+        aim_locked = (
+            intercept is not None
+            and abs(angle_error) < self._aim_lock_angle_deg
+            and norm_bullet_t < 0.55
+        )
+        if aim_locked and abs(angle_error) < self._fire_threshold:
+            turn_rate = 0.0
+
         thrust = 0.0
         if dodge_threat is not None and closest_tti is not None:
-            if closest_tti < tti_hard:
-                thrust = _geometric_dodge_thrust(
-                    self.sa.ownship.heading, dodge_threat, self._thrust_hard)
-            elif closest_tti < tti_soft:
-                thrust = _geometric_dodge_thrust(
-                    self.sa.ownship.heading, dodge_threat, self._thrust_soft)
+            sx, sy = self.sa.ownship.position
+            ax, ay = dodge_threat.position_wrap
+            vx, vy = dodge_threat.velocity
 
-        fire = (
+            rel_x = sx - ax
+            rel_y = sy - ay
+            rel_u = _safe_unit(rel_x, rel_y)
+            vel_u = _safe_unit(vx, vy)
+
+            # 1.0 means asteroid velocity points directly toward ship.
+            closing_alignment = max(0.0, -(vel_u[0] * rel_u[0] + vel_u[1] * rel_u[1]))
+            norm_size = float((dodge_threat.size - 1) / 3.0)
+
+            hard_gate = self._closing_gate_hard - self._size_bias * norm_size
+            soft_gate = self._closing_gate_soft - self._size_bias * norm_size
+
+            urgent_soft_threat = closest_tti < max(0.65 * tti_hard, 0.45)
+            easy_shot_freeze = (
+                intercept is not None
+                and norm_bullet_t < 0.45
+                and abs(angle_error) < max(2.0, 0.6 * self._fire_threshold)
+            )
+
+            soft_allowed = (
+                (not easy_shot_freeze) and
+                ((not aim_locked) or urgent_soft_threat or (self._aim_lock_soft_suppression < 0.35))
+            )
+            should_hard_dodge = (
+                (not easy_shot_freeze)
+                and closest_tti < tti_hard
+                and closing_alignment >= max(0.0, hard_gate)
+            )
+            should_soft_dodge = (
+                closest_tti < tti_soft
+                and closing_alignment >= max(0.0, soft_gate)
+                and soft_allowed
+            )
+
+            if should_hard_dodge:
+                thrust = _learned_dodge_thrust(
+                    self.sa.ownship.heading,
+                    self.sa.ownship.position,
+                    dodge_threat,
+                    self._thrust_hard,
+                    self.chromosome,
+                )
+            elif should_soft_dodge:
+                thrust = _learned_dodge_thrust(
+                    self.sa.ownship.heading,
+                    self.sa.ownship.position,
+                    dodge_threat,
+                    self._thrust_soft,
+                    self.chromosome,
+                )
+
+        fire = bool(
             intercept is not None
             and abs(angle_error) < self._fire_threshold
             and norm_bullet_t < 0.85
         )
 
-        drop_mine = self.should_drop_mine(
+        stationary_like_target = (
+            best_target is not None
+            and math.hypot(best_target.velocity[0], best_target.velocity[1]) < 20.0
+        )
+        if stationary_like_target and intercept is not None and norm_bullet_t < 0.50:
+            if abs(angle_error) < max(2.0, 0.5 * self._fire_threshold):
+                turn_rate = 0.0
+                thrust = 0.0
+
+        if fire and abs(angle_error) < max(1.0, 0.35 * self._fire_threshold):
+            turn_rate = 0.0
+
+        drop_mine = bool(self.should_drop_mine(
             closest_tti=closest_tti,
             impacters=impacters,
             fire_ready=fire,
-        )
+        ))
 
         return float(thrust), float(turn_rate), bool(fire), bool(drop_mine)
 

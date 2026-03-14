@@ -1,5 +1,5 @@
 # Load and run the best trained GAFuzzyController
-#
+#type: ignore
 # Run from project root:   python load_trained.py
 
 import sys, os, json
