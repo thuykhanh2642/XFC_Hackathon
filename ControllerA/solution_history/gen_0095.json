@@ -1,10 +1,15 @@
 {
-  "generation": 97,
+  "generation": 95,
   "fitness": [
     -0.3784630030861855
   ],
   "validation_score": -1.8532255141309522,
-  "validation_details": null,
+  "validation_details": {
+    "Moving Maze (Rightward Tunnel)": -1.8794372294372295,
+    "Four Corner Assault": 0.7100694444444444,
+    "Cross (Rotating Look, CW)": -1.183857729138167,
+    "Sniper Practice (Large Arena)": 0.5
+  },
   "genome": [
     0.8099459128967877,
     0.1655391657440587,
