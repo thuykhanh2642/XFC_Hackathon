@@ -337,7 +337,7 @@ class GAFuzzyController(KesslerController):
             fire_ready=fire,
         )
 
-        return thrust, turn_rate, fire, drop_mine
+        return float(thrust), float(turn_rate), bool(fire), bool(drop_mine)
 
     @property
     def name(self) -> str:
