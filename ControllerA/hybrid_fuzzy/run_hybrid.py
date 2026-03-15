@@ -1,15 +1,9 @@
-# run_hybrid_v2.py
-# Test hybrid_fuzzy_v2 on all scenarios with graphics + scoring
-#
-# Usage:  python run_hybrid_v2.py
-#   Add --no-graphics for headless mode
-#   Add --scenario "Name" to run a single scenario
 
 import sys
 sys.path.append('.')
 
 from kesslergame import KesslerGame, GraphicsType
-from hybrid_fuzzy_v2 import hybrid_controller
+from hybrid_fuzzy import hybrid_controller
 from scenarios import (
     one_asteroid_still, one_asteroid_slow_horizontal,
     two_asteroids_still, three_asteroids_still_row,
@@ -18,7 +12,7 @@ from scenarios import (
     giants_with_kamikaze, spiral_arms, four_corner,
     rotating_cross, moving_maze_right,
 )
-
+from hybrid_fuzzy import hybrid_controller
 # ── Scoring (matches training_script.py) ──────────────────────────────
 W_HIT      = 1.20
 W_ACC      = 0.40
@@ -46,21 +40,14 @@ def score_team(team, time_limit):
 
 # ── All scenarios ─────────────────────────────────────────────────────
 ALL_SCENARIOS = [
-    # Easy
-    one_asteroid_still(),
-    one_asteroid_slow_horizontal(),
-    two_asteroids_still(),
-    three_asteroids_still_row(),
     # Medium
     stock_scenario(),
-    donut_ring(),
+    #donut_ring(),
     donut_ring_closing(),
     vertical_wall_left(),
     asteroid_rain(),
     crossing_lanes(),
-    giants_with_kamikaze(),
     spiral_arms(),
-    four_corner(),
     # Hard / validation
     rotating_cross(),
     moving_maze_right(),

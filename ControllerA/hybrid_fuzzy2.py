@@ -3,39 +3,55 @@ from collections import deque
 from kesslergame.controller import KesslerController
 from util import wrap180, triag
 
+# --- ship facts the universe agreed on ---
 SHIP_RADIUS = 20.0
-BULLET_SPEED = 800.0
+BULLET_SPEED = 800.0  # go fast little bullet
 
-FIRE_COOLDOWN_FRAMES = 0
-AIM_STABLE_REQUIRED = 1
-GUN_LOCK_FRAMES = 5
+# --- shooting timing ---
+FIRE_COOLDOWN_FRAMES = 0   # no mercy, fire every frame
+AIM_STABLE_REQUIRED = 1    # one good frame is enough
+GUN_LOCK_FRAMES = 14       # stick with a target for a bit
 
-MAX_BULLET_TIME = 2.0
-MIN_ANGLE_LIMIT = 2.0
-STABLE_TURN_RATE = 42.0
-AIM_SAFETY = 0.9
+# --- aim geometry ---
+MAX_BULLET_TIME = 2.0      # don't shoot at asteroids in another timezone
+MIN_ANGLE_LIMIT = 1.8      # smallest allowed aim window
+STABLE_TURN_RATE = 42.0    # spinning faster than this means we're not stable
+AIM_SAFETY = 1.15          # fudge factor so we don't shave the hitbox
 
-# Evasion parameters (tuned for smoothness)
-EVASION_RANGE = 350.0               # consider asteroids within this distance
-EVASION_FORCE_GAIN = 2.0             # base repulsion strength
-VELOCITY_FORCE_GAIN = 0.5             # extra push if asteroid moves toward you
-MAX_EVASION_SPEED = 220.0             # slightly reduced to avoid overshoot
-MIN_EVASION_DIST = 180.0              # if any asteroid closer than this, force hard turn
-ESCAPE_SMOOTHING = 0.22                # low‑pass filter coefficient (0=instant, 1=no update)
-TURN_FIRST_THRESH = 24.0               # degrees: if heading error > this, reduce thrust
+# --- fire quality gates (fuzzy score thresholds) ---
+FIRE_Q_STANDARD  = 0.35    # good enough
+FIRE_Q_ENGAGE    = 0.45    # picky mode
+FIRE_Q_PRESSURE  = 0.25    # desperate mode
+FIRE_Q_GOOD_SHOT = 0.55    # confident enough to stop moving
 
-# Short-horizon search / action scoring
-TURN_GAIN = 4.0
-TURN_SOFTEN_THRESH = 28.0
-SEARCH_DT = 0.16
-SEARCH_STEPS = 8
-SAFE_MARGIN = 55.0
-STATIONARY_SPEED = 28.0
-COMMIT_FRAMES = 5
-COMMIT_MARGIN = 22.0
-TIE_MARGIN = 12.0
-SYMMETRY_SIDE_BONUS = 7.0
-STABLE_SHOT_HOLD_BONUS = 18.0
+# --- evasion: run away, but elegantly ---
+EVASION_RANGE = 380.0      # how far to care about incoming rocks
+EVASION_FORCE_GAIN = 3.5   # how hard we push away
+VELOCITY_FORCE_GAIN = 0.8
+MAX_EVASION_SPEED = 220.0
+MIN_EVASION_DIST = 160.0
+ESCAPE_SMOOTHING = 0.50    # low-pass on escape heading: 0=instant, 1=comatose
+TURN_FIRST_THRESH = 24.0   # back-compat name, not used directly anymore
+
+# --- action search ---
+TURN_GAIN = 7.0              # P-term gain for turning
+TURN_SOFTEN_THRESH = 32.0    # start reducing thrust when error > this
+SEARCH_DT = 0.16             # seconds per lookahead step
+SEARCH_STEPS = 8             # steps to simulate (~1.3 s horizon)
+SAFE_MARGIN = 70.0           # gap below this and we panic
+STATIONARY_SPEED = 28.0      # slow enough to call "stopped"
+COMMIT_FRAMES = 3            # frames before we're allowed to change our mind
+COMMIT_MARGIN = 22.0         # how much better the new action must be to switch
+TIE_MARGIN = 12.0            # tie-break window for mirrored actions
+SYMMETRY_SIDE_BONUS = 7.0    # nudge toward our preferred turning side
+STABLE_SHOT_HOLD_BONUS = 40.0 # big bonus for staying still on a good shot
+TARGET_APPROACH_GAIN = 5.0   # reward for drifting toward the target
+
+# --- PI controller for heading ---
+INTEGRAL_GAIN   = 0.4   # how strongly the I-term nudges turn rate
+INTEGRAL_DECAY  = 0.88  # per-frame leak: old errors fade, new ones dominate
+INTEGRAL_UPDATE = 0.06  # how fast error feeds into the integrator
+INTEGRAL_CLAMP  = 50.0  # cap so the I-term doesn't go full maniac
 
 ACTION_LIBRARY = [
     ("hold", 0.0, 0.0),
@@ -50,9 +66,7 @@ ACTION_LIBRARY = [
     ("back_right", 38.0, -65.0),
 ]
 
-
-# ── Geometry helpers (unchanged) ──────────────────────────────────────
-
+# Wrap a delta into [-size/2, size/2] for toroidal maps
 def wrap_delta(d, size):
     d = d % size
     if d > size / 2:
@@ -70,9 +84,7 @@ def toro_dist(sx, sy, ax, ay, map_size):
 def direct_dx_dy(sx, sy, ax, ay):
     return ax - sx, ay - sy
 
-
-# ── Intercept helpers (unchanged) ────────────────────────────────────
-
+# Solve the bullet-meets-asteroid quadratic. Returns (hit_dx, hit_dy, time) or None.
 def _solve_intercept(dx, dy, vx, vy):
     a = vx**2 + vy**2 - BULLET_SPEED**2
     b = 2.0 * (dx * vx + dy * vy)
@@ -110,9 +122,48 @@ def direct_intercept(ship_pos, ship_vel, ast_pos, ast_vel):
     rvy = avy - svy
     return _solve_intercept(dx, dy, rvx, rvy)
 
+# Fuzzy membership functions: trap, rising edge, falling edge
+def _trap(x, a, b, c, d):
+    """Trapezoidal MF: 0 outside [a,d], ramp up a→b, flat b→c, ramp down c→d."""
+    if x <= a or x >= d:
+        return 0.0
+    if b <= x <= c:
+        return 1.0
+    if x < b:
+        return (x - a) / (b - a)
+    return (d - x) / (d - c)
 
-# ── TTI / impact helpers (unchanged) ─────────────────────────────────
+def _rising(x, lo, hi):
+    """Rising-edge MF: 0 at x<=lo, linear ramp, 1 at x>=hi."""
+    if x <= lo: return 0.0
+    if x >= hi: return 1.0
+    return (x - lo) / (hi - lo)
 
+def _falling(x, lo, hi):
+    """Falling-edge MF: 1 at x<=lo, linear ramp, 0 at x>=hi."""
+    return 1.0 - _rising(x, lo, hi)
+
+# How good is this shot? Combines aim, flight time, distance, stability into [0,1].
+# All four factors multiply, so being terrible at one kills the score entirely.
+def fuzzy_shot_quality(heading_err_abs, angle_limit, bullet_t, fire_dist, stable):
+    aim  = _falling(heading_err_abs, angle_limit * 0.50, angle_limit * 1.10)
+    time = _falling(bullet_t,  0.60, MAX_BULLET_TIME)
+    dist = _falling(fire_dist, 350.0, 900.0)
+    stab = 1.0 if stable else 0.70
+    return aim * time * dist * stab
+
+# Smoothly reduce thrust when we're turning hard. Full power below 10°, mostly gone above 35°.
+def fuzzy_thrust_scale(turn_err_abs):
+    return max(0.15, _falling(turn_err_abs, 10.0, 35.0))
+
+# How much are we in each mode? Overlapping bands mean no jarring snap transitions.
+def fuzzy_danger_blend(danger_level):
+    engage_w     = _falling(danger_level, 0.30, 0.50)
+    reposition_w = _trap(danger_level,    0.30, 0.42, 0.62, 0.75)
+    evade_w      = _rising(danger_level,  0.58, 0.75)
+    return engage_w, reposition_w, evade_w
+
+# Time-to-impact via AABB interval check. Returns seconds until collision, or None.
 def compute_tti(ship_pos, ship_vel, ast_pos, ast_vel, ast_radius, map_size):
     sx, sy = ship_pos
     dx, dy = toro_dx_dy(sx, sy, ast_pos[0], ast_pos[1], map_size)
@@ -122,20 +173,30 @@ def compute_tti(ship_pos, ship_vel, ast_pos, ast_vel, ast_radius, map_size):
 
     dvx = vsx - vax
     dvy = vsy - vay
-    if dvx == 0:
-        dvx = 1e-10
-    if dvy == 0:
-        dvy = 1e-10
 
-    tixs = [-(dx + so) / dvx, -(dx - so) / dvx]
-    tiys = [-(dy + so) / dvy, -(dy - so) / dvy]
-    tix_lo, tix_hi = min(tixs), max(tixs)
-    tiy_lo, tiy_hi = min(tiys), max(tiys)
+    if abs(dvx) > 1e-9:
+        tixs = sorted([-(dx + so) / dvx, -(dx - so) / dvx])
+        tix_lo, tix_hi = tixs[0], tixs[1]
+    else:
+        
+        if abs(dx) >= so:
+            return None
+        tix_lo, tix_hi = -1e18, 1e18
 
-    if tix_hi > tiy_lo and tiy_hi > tix_lo:
-        tti = min(min(tix_hi, tiy_hi), max(tix_lo, tiy_lo))
-        return tti if tti > 0 else None
-    return None
+    if abs(dvy) > 1e-9:
+        tiys = sorted([-(dy + so) / dvy, -(dy - so) / dvy])
+        tiy_lo, tiy_hi = tiys[0], tiys[1]
+    else:
+        if abs(dy) >= so:
+            return None
+        tiy_lo, tiy_hi = -1e18, 1e18
+
+    enter = max(tix_lo, tiy_lo)
+    leave = min(tix_hi, tiy_hi)
+    if leave <= enter:
+        return None
+    tti = enter if enter > 0 else leave
+    return tti if tti > 0 else None
 
 def find_impacters(asteroids, ship_pos, ship_vel, map_size, max_n=5):
     hits = []
@@ -147,7 +208,6 @@ def find_impacters(asteroids, ship_pos, ship_vel, map_size, max_n=5):
             hits.append((a, tti))
     hits.sort(key=lambda x: x[1])
     return hits[:max_n]
-
 
 def threat_time_metrics(ship_pos, ship_vel, ast_pos, ast_vel, ast_radius, map_size):
     sx, sy = ship_pos
@@ -177,7 +237,6 @@ def threat_time_metrics(ship_pos, ship_vel, ast_pos, ast_vel, ast_radius, map_si
     tti = compute_tti(ship_pos, ship_vel, ast_pos, ast_vel, ast_radius, map_size)
     return dx, dy, center_dist, surface_dist, closing_speed, t_closest, closest_surface, tti
 
-
 def threat_direction_bucket(rel_bearing_deg):
     a = abs(rel_bearing_deg)
     if a <= 50.0:
@@ -185,7 +244,6 @@ def threat_direction_bucket(rel_bearing_deg):
     if a >= 130.0:
         return "rear"
     return "side"
-
 
 def score_threat_entry(entry):
     dist_term = 950.0 / max(entry["surface_dist"] + 35.0, 35.0)
@@ -216,7 +274,7 @@ def score_threat_entry(entry):
 
     return dist_term + closing_term + tti_term + miss_term + size_term + direction_term + imminent_bonus
 
-
+# Score every asteroid and sort worst-first. This is our threat radar.
 def build_threat_table(asteroids, ship_pos, ship_vel, heading, map_size):
     threats = []
     for a in asteroids:
@@ -253,7 +311,7 @@ def build_threat_table(asteroids, ship_pos, ship_vel, heading, map_size):
     threats.sort(key=lambda e: e["danger_score"], reverse=True)
     return threats
 
-
+# Distill the threat table into a single danger level and the worst offenders.
 def summarize_threats(threats):
     if not threats:
         return None, [], 0.0, None, 0
@@ -273,9 +331,13 @@ def summarize_threats(threats):
     if primary["surface_dist"] < 85.0:
         danger_level = max(danger_level, 0.9)
 
+    n_nearby = sum(1 for t in threats if t["surface_dist"] < 380.0)
+    crowd_pressure = min(0.55, n_nearby * 0.028)
+    danger_level = max(danger_level, crowd_pressure)
+
     return primary, top_threats, danger_level, soonest_tti, n_imminent
 
-
+# Are we shooting, running, or somewhere in between?
 def choose_mode(primary_threat, top_threats, danger_level, soonest_tti, n_imminent):
     if primary_threat is None:
         return "engage"
@@ -305,7 +367,7 @@ def choose_mode(primary_threat, top_threats, danger_level, soonest_tti, n_immine
 
     return "engage"
 
-
+# Something behind us is about to ruin our day.
 def detect_rear_interrupt(top_threats):
     if not top_threats:
         return False, None
@@ -339,8 +401,6 @@ def detect_rear_interrupt(top_threats):
     )
     return urgent, best
 
-# ── Target scoring (unchanged) ───────────────────────────────────────
-
 def calculate_threat_priority(asteroid, ship_pos, ship_vel, map_size):
     ax, ay = asteroid.position
     dx, dy = toro_dx_dy(ship_pos[0], ship_pos[1], ax, ay, map_size)
@@ -353,15 +413,16 @@ def calculate_threat_priority(asteroid, ship_pos, ship_vel, map_size):
     size_bonus = {4: 5.0, 3: 3.0, 2: 1.0, 1: -1.0}.get(size, 0.0)
     return (900.0 / max(distance, 1.0)) + max(closing_speed, 0.0) / 60.0 + size_bonus
 
-
 def max_aim_error(asteroid, distance):
-    radius = getattr(asteroid, "radius", 10.0)
-    if distance < radius:
+    radius = float(getattr(asteroid, "radius", 10.0))
+    size = int(getattr(asteroid, "size", 2))
+    
+    effective_radius = radius + {1: 5.0, 2: 3.0, 3: 1.5}.get(size, 0.0)
+    if distance < effective_radius:
         return 180.0
-    safe_ratio = min(radius / distance, 1.0)
+    safe_ratio = min(effective_radius / distance, 1.0)
     error_rad = math.asin(safe_ratio)
     return math.degrees(error_rad) * AIM_SAFETY
-
 
 def gun_target_score(asteroid, ship_pos, ship_vel, heading_deg):
     intercept = direct_intercept(ship_pos, ship_vel, asteroid.position, getattr(asteroid, "velocity", (0.0, 0.0)))
@@ -372,12 +433,12 @@ def gun_target_score(asteroid, ship_pos, ship_vel, heading_deg):
     aim_heading = math.degrees(math.atan2(dy, dx))
     aim_err = abs(wrap180(aim_heading - heading_deg))
     dist = math.hypot(dx, dy)
-    size = getattr(asteroid, "size", 2)
+    size = int(getattr(asteroid, "size", 2))
+    radius = float(getattr(asteroid, "radius", 10.0))
+    feasibility = (radius + 6.0) / max(dist, 1.0)
 
-    return size * 3.0 - aim_err * 0.5 - t * 3.0 - dist * 0.0015
-
-
-# ── Spatial helpers (unchanged) ──────────────────────────────────────
+    size_bonus = {4: 10.0, 3: 6.0, 2: 2.5, 1: -2.0}.get(size, 0.0)
+    return size_bonus + feasibility * 1400.0 - aim_err * 0.95 - t * 4.0 - dist * 0.003
 
 def find_closest_threat(asteroids, ship_pos, map_size):
     closest_dist = float('inf')
@@ -390,7 +451,6 @@ def find_closest_threat(asteroids, ship_pos, map_size):
             closest_dist = gap
             closest_asteroid = asteroid
     return closest_asteroid, max(closest_dist, 1.0)
-
 
 def rear_clearance(ship_pos, heading_deg, asteroids, map_size, check_range=200.0, safety=40.0):
     hx = math.cos(math.radians(heading_deg + 180))
@@ -406,7 +466,6 @@ def rear_clearance(ship_pos, heading_deg, asteroids, map_size, check_range=200.0
                 return False
     return True
 
-
 def forward_clearance(ship_pos, heading_deg, asteroids, map_size, check_range=220.0, safety=55.0):
     hx = math.cos(math.radians(heading_deg))
     hy = math.sin(math.radians(heading_deg))
@@ -421,7 +480,6 @@ def forward_clearance(ship_pos, heading_deg, asteroids, map_size, check_range=22
                 return False
     return True
 
-
 def projected_speed_toward(ship_vel, dir_x, dir_y):
     mag = math.hypot(dir_x, dir_y)
     if mag < 1e-6:
@@ -429,9 +487,7 @@ def projected_speed_toward(ship_vel, dir_x, dir_y):
     ux, uy = dir_x / mag, dir_y / mag
     return ship_vel[0] * ux + ship_vel[1] * uy
 
-
-# ── SMOOTH POTENTIAL‑FIELD EVASION ───────────────────────────────────
-
+# Sum repulsion vectors from nearby asteroids. Closing fast = extra push.
 def potential_field_force(ship_pos, ship_vel, asteroids, map_size, range_limit=EVASION_RANGE):
     """
     Returns a (fx, fy) force vector pointing away from danger.
@@ -442,31 +498,26 @@ def potential_field_force(ship_pos, ship_vel, asteroids, map_size, range_limit=E
         dx, dy = toro_dx_dy(ship_pos[0], ship_pos[1], a.position[0], a.position[1], map_size)
         dist = math.hypot(dx, dy)
         if dist < range_limit:
-            # Distance factor: linear falloff
+            
             dist_factor = (range_limit - dist) / (dist + SHIP_RADIUS)
 
-            # Velocity factor: if asteroid moving toward ship, increase repulsion
             avx, avy = getattr(a, "velocity", (0.0, 0.0))
             rel_vx = avx - ship_vel[0]
             rel_vy = avy - ship_vel[1]
-            # Dot product of relative velocity with direction to asteroid
+            
             closing = (rel_vx * dx + rel_vy * dy) / max(dist, 1.0)
-            vel_factor = max(0.0, closing) * VELOCITY_FORCE_GAIN   # only positive (closing) contributes
+            vel_factor = max(0.0, closing) * VELOCITY_FORCE_GAIN   
 
             weight = EVASION_FORCE_GAIN * dist_factor + vel_factor
 
-            # Repulsion points away from asteroid
             fx -= dx * weight
             fy -= dy * weight
 
     return fx, fy
 
-
-
 def wrap_position(x, y, map_size):
     w, h = map_size
     return x % w, y % h
-
 
 def lane_density_score(ship_pos, lane_heading_deg, asteroids, map_size, look_range=340.0, half_width=85.0):
     hx = math.cos(math.radians(lane_heading_deg))
@@ -488,7 +539,6 @@ def lane_density_score(ship_pos, lane_heading_deg, asteroids, map_size, look_ran
                 total += 1.5 * closeness + 1.1 * cross_pen + 0.006 * closing
     return total
 
-
 def threat_table_snapshot(threats):
     snaps = []
     for t in threats:
@@ -502,7 +552,6 @@ def threat_table_snapshot(threats):
         })
     return snaps
 
-
 def min_gap_to_asteroids(ship_pos, asteroids, map_size):
     best = float("inf")
     sx, sy = ship_pos
@@ -511,7 +560,6 @@ def min_gap_to_asteroids(ship_pos, asteroids, map_size):
         if d < best:
             best = d
     return best if best != float("inf") else 9999.0
-
 
 def blended_escape_heading(top_threats, desired_heading, rear_interrupt=False):
     if not top_threats:
@@ -530,7 +578,7 @@ def blended_escape_heading(top_threats, desired_heading, rear_interrupt=False):
     mix = 0.78 if rear_interrupt else 0.62
     return wrap180(mix * esc + (1.0 - mix) * desired_heading)
 
-
+# Roll each candidate action forward in time and score how not-dead we are.
 def simulate_action_score(
     ship_pos,
     ship_vel,
@@ -543,12 +591,22 @@ def simulate_action_score(
     good_shot,
     mode,
     rear_interrupt,
+    target_pos=None,          
+    target_vel=None,          
 ):
     sx, sy = float(ship_pos[0]), float(ship_pos[1])
     svx, svy = float(ship_vel[0]), float(ship_vel[1])
     heading = float(ship_heading)
     score = 0.0
     horizon = [dict(a) for a in threat_snaps]
+
+    if target_pos is not None and target_vel is not None:
+        tx, ty = float(target_pos[0]), float(target_pos[1])
+        tvx, tvy = float(target_vel[0]), float(target_vel[1])
+        prev_target_dist = toro_dist(sx, sy, tx, ty, map_size)
+    else:
+        tx = ty = tvx = tvy = None
+        prev_target_dist = None
 
     for step in range(SEARCH_STEPS):
         err = wrap180(target_heading - heading)
@@ -574,15 +632,40 @@ def simulate_action_score(
             avx, avy = a["vel"]
             a["pos"] = wrap_position(ax + avx * SEARCH_DT, ay + avy * SEARCH_DT, map_size)
 
+        if target_pos is not None:
+            tx, ty = wrap_position(tx + tvx * SEARCH_DT, ty + tvy * SEARCH_DT, map_size)
+
+            retreating = (
+                mode == "cleanup"
+                and target_vel is not None
+                and tx is not None
+            )
+            if retreating:
+                tp_dx2 = tx - sx
+                tp_dy2 = ty - sy
+                tp_d2 = math.hypot(tp_dx2, tp_dy2)
+                if tp_d2 > 1e-6:
+                    closing2 = (tvx * tp_dx2 + tvy * tp_dy2) / tp_d2
+                    retreating = closing2 < -1.0 and tp_d2 > 280.0
+                else:
+                    retreating = False
+
+            if not good_shot or retreating:
+                current_target_dist = toro_dist(sx, sy, tx, ty, map_size)
+                reduction = prev_target_dist - current_target_dist
+                score += reduction * TARGET_APPROACH_GAIN
+                prev_target_dist = current_target_dist
+
         gap = min_gap_to_asteroids((sx, sy), horizon, map_size)
+        # instant death: inside a rock
         if gap < 0.0:
             return -1e6 + gap * 1000.0
 
         score += min(gap, 220.0) * 1.15
         if gap < SAFE_MARGIN:
-            score -= (SAFE_MARGIN - gap) * 34.0
-        elif gap < 95.0:
-            score -= (95.0 - gap) * 6.0
+            score -= (SAFE_MARGIN - gap) * 50.0
+        elif gap < 110.0:
+            score -= (110.0 - gap) * 8.0
 
         worst_pen = 0.0
         rear_pen = 0.0
@@ -600,22 +683,28 @@ def simulate_action_score(
 
         score -= worst_pen
         score -= rear_pen * (1.45 if rear_interrupt else 1.0)
-        score -= 36.0 * lane_density_score((sx, sy), heading, horizon, map_size)
 
         fire_err = abs(wrap180(desired_fire_heading - heading))
+
+        eng_w, rep_w, evd_w = fuzzy_danger_blend(
+            0.0 if mode == "cleanup" else
+            (1.0 if mode == "evade" else
+             (0.8 if rear_interrupt else
+              min(1.0, (worst_pen + rear_pen * 0.5) / 120.0)))
+        )
+
+        lane_mult_fuzzy = 15.0 * eng_w + 22.0 * rep_w + 36.0 * evd_w
+        if mode == "cleanup":
+            lane_mult_fuzzy = 8.0
+        score -= lane_mult_fuzzy * lane_density_score((sx, sy), heading, horizon, map_size)
+
         if mode == "engage":
-            aim_weight = 1.85 if not rear_interrupt else 0.30
             if good_shot:
-                aim_weight += 0.80
-            score -= fire_err * aim_weight
-            if fire_err > 12.0:
-                score -= (fire_err - 12.0) * 10.0
-            if fire_err > 22.0:
-                score -= (fire_err - 22.0) * 22.0
+                score -= fire_err * fire_err * 0.5
+            else:
+                score -= fire_err * (0.8 * eng_w + 0.3 * rep_w + 0.05 * evd_w)
         elif mode == "cleanup":
-            score -= fire_err * 1.55
-            if fire_err > 10.0:
-                score -= (fire_err - 10.0) * 8.0
+            score -= fire_err * 2.5
         elif mode == "reposition":
             score -= fire_err * (0.25 if good_shot else 0.10)
         else:
@@ -627,9 +716,6 @@ def simulate_action_score(
     final_gap = min_gap_to_asteroids((sx, sy), horizon, map_size)
     score += min(final_gap, 260.0) * 1.9
     return score
-
-
-# ── Main controller ──────────────────────────────────────────────────
 
 class hybrid_controller_v2(KesslerController):
     def __init__(self):
@@ -646,6 +732,8 @@ class hybrid_controller_v2(KesslerController):
         self._preferred_side = 1
         self._debug_enabled = True
         self._last_action_debug = None
+        self._integral_error = 0.0
+        self._integral_gain = INTEGRAL_GAIN
 
     def _action_side(self, name):
         if "left" in name:
@@ -666,6 +754,7 @@ class hybrid_controller_v2(KesslerController):
                 return name, score
         return best_name, best_score
 
+    # Score all actions and pick the one that keeps us alive longest.
     def _choose_movement_action(
         self,
         ship_pos,
@@ -678,6 +767,8 @@ class hybrid_controller_v2(KesslerController):
         mode,
         top_threats,
         rear_interrupt,
+        target_pos=None,          
+        target_vel=None,          
     ):
         threat_snaps = threat_table_snapshot(top_threats if top_threats else [])
         escape_heading = blended_escape_heading(top_threats, desired_heading, rear_interrupt=rear_interrupt)
@@ -706,6 +797,8 @@ class hybrid_controller_v2(KesslerController):
             score = simulate_action_score(
                 ship_pos, ship_vel, heading, thrust_cmd, target_heading, threat_snaps, map_size,
                 desired_heading, good_shot, mode, rear_interrupt,
+                target_pos=target_pos,          
+                target_vel=target_vel,
             )
 
             if thrust_cmd < 0.0:
@@ -717,25 +810,20 @@ class hybrid_controller_v2(KesslerController):
                     score += 42.0
                 elif thrust_cmd > 0:
                     score -= 25.0
-                if abs(heading_offset) > 22.0:
-                    score -= 28.0
             elif mode == "engage":
-                heading_gap = abs(wrap180(target_heading - desired_heading))
-                if name == "hold":
-                    score += 20.0 if good_shot else 10.0
+                if name == "hold" and good_shot:
+                    score += 16.0
                 if thrust_cmd < 0.0 and danger_level < 0.35:
                     score -= 12.0
-                if not rear_interrupt and danger_level < 0.35:
-                    if abs(heading_offset) > 22.0:
-                        score -= 42.0
-                    if heading_gap > 15.0:
-                        score -= (heading_gap - 15.0) * 8.0
-                    if heading_gap > 28.0:
-                        score -= (heading_gap - 28.0) * 14.0
-                    if name in ("left", "right", "back_left", "back_right", "forward") and not good_shot:
-                        score -= 16.0
-                    if name in ("left_soft", "right_soft") and heading_gap <= 22.0:
-                        score += 8.0
+                off_target = abs(wrap180(target_heading - desired_heading))
+                score -= off_target * 0.9
+                if off_target <= 5.0 and name in ("hold", "left_soft", "right_soft"):
+                    score += 10.0
+                
+                n_nearby_snap = sum(1 for a in threat_snaps if
+                    math.hypot(a["pos"][0] - ship_pos[0], a["pos"][1] - ship_pos[1]) < 400.0)
+                if name in ("hold", "brake", "hard_brake") and n_nearby_snap >= 6:
+                    score -= (n_nearby_snap - 5) * 14.0
             elif mode == "reposition":
                 if name in ("left_soft", "right_soft"):
                     score += 12.0
@@ -747,6 +835,21 @@ class hybrid_controller_v2(KesslerController):
                     score += 7.0
                 else:
                     score -= 5.0
+
+            if good_shot and target_pos is not None and thrust_cmd > 0:
+                
+                score -= 30.0
+
+            if (mode == "cleanup" and thrust_cmd > 0
+                    and target_vel is not None and target_pos is not None):
+                
+                tp_dx, tp_dy = target_pos[0] - ship_pos[0], target_pos[1] - ship_pos[1]
+                tp_dist = math.hypot(tp_dx, tp_dy)
+                if tp_dist > 1e-6:
+                    closing = (target_vel[0] * tp_dx + target_vel[1] * tp_dy) / tp_dist
+                    if closing < -1.0 and tp_dist > 280.0:
+                        
+                        score += 30.0
 
             side = self._action_side(name)
             if near_stationary and side != 0:
@@ -798,6 +901,7 @@ class hybrid_controller_v2(KesslerController):
 
         return best_name, best_target, best_thrust
 
+    # Pick the best asteroid to shoot. Locks onto a target for a few frames to avoid flailing.
     def _pick_gun_target(self, asteroids, ship_pos, ship_vel, heading, map_size, closest_asteroid=None):
         if self._gun_lock_timer > 0 and self._gun_lock_pos is not None:
             lx, ly = self._gun_lock_pos
@@ -821,10 +925,18 @@ class hybrid_controller_v2(KesslerController):
             best = closest_asteroid
 
         if best is not None:
+            if self._gun_lock_pos is None or toro_dist(
+                best.position[0], best.position[1],
+                self._gun_lock_pos[0], self._gun_lock_pos[1],
+                map_size,
+            ) > 120:
+                
+                self._integral_error = 0.0
             self._gun_lock_pos = best.position
             self._gun_lock_timer = GUN_LOCK_FRAMES
         return best
 
+    # Main decision loop. Called every frame. Must not crash.
     def actions(self, ship_state, game_state):
         self.debug_counter += 1
 
@@ -843,7 +955,7 @@ class hybrid_controller_v2(KesslerController):
         svx, svy = getattr(ship_state, "velocity", (0.0, 0.0))
         map_size = getattr(game_state, "map_size", (1000, 800))
 
-        # --- THREAT ASSESSMENT (Phase A: global threat table) ---
+        # Phase A: who wants us dead?
         threats = build_threat_table(asteroids, (sx, sy), (svx, svy), heading, map_size)
         primary_threat, top_threats, danger_level, soonest_tti, n_imminent = summarize_threats(threats)
         if primary_threat is None:
@@ -865,18 +977,16 @@ class hybrid_controller_v2(KesslerController):
         center_dist = primary_threat["center_dist"]
         medium = triag(center_dist, 250, 400, 600)
 
-        # Keep a compatibility view for the rest of the controller for now.
         impacters = [(t["asteroid"], t["tti"]) for t in threats if t["tti"] is not None]
         impacters.sort(key=lambda x: x[1])
         dodge_target_ast = impacters[0][0] if impacters else closest_asteroid
 
-        # Top threats are now available for later phases/debug.
         self._last_top_threats = top_threats
         self._last_mode = mode
         self._last_rear_interrupt = rear_interrupt
         self._last_rear_interrupt_threat = rear_interrupt_threat
 
-        # --- FIRING (unchanged, still accurate) ---
+        # Phase B: pick a target and compute the intercept
         fire_target = self._pick_gun_target(asteroids, (sx, sy), (svx, svy), heading, map_size, closest_asteroid)
         target_vel = getattr(fire_target, "velocity", (0.0, 0.0))
         target_size = getattr(fire_target, "size", 2)
@@ -891,6 +1001,13 @@ class hybrid_controller_v2(KesslerController):
 
         desired_heading = math.degrees(math.atan2(fire_dy, fire_dx))
         fire_heading_err = wrap180(desired_heading - heading)
+        
+        self._integral_error *= INTEGRAL_DECAY
+        self._integral_error = max(
+            -INTEGRAL_CLAMP,
+            min(INTEGRAL_CLAMP, self._integral_error + fire_heading_err * INTEGRAL_UPDATE),
+        )
+
         fire_dist = math.hypot(fire_dx, fire_dy)
 
         angle_limit = max_aim_error(fire_target, fire_dist)
@@ -899,116 +1016,158 @@ class hybrid_controller_v2(KesslerController):
         turn_rate_mag = abs(self._last_turn_rate)
         stable = turn_rate_mag < STABLE_TURN_RATE
 
-        if intercept is not None and bullet_t < MAX_BULLET_TIME and abs(fire_heading_err) < angle_limit and stable:
-            self._good_aim_frames += 1
-        else:
-            self._good_aim_frames = 0
+        cleanup_fire_limit = max(angle_limit + 1.8, 3.8)
+        shot_good_limit = cleanup_fire_limit if mode == "cleanup" else max(angle_limit * 1.18, angle_limit + 1.0, 3.0)
+        aim_build_limit = cleanup_fire_limit if mode == "cleanup" else max(angle_limit * 1.10, angle_limit + 0.8, 2.8)
 
-        fire = (
-            intercept is not None
-            and self._fire_cooldown == 0
-            and self._good_aim_frames >= AIM_STABLE_REQUIRED
-            and abs(fire_heading_err) < angle_limit
-            and bullet_t < MAX_BULLET_TIME
-            and fire_dist < 950
+        shot_q = fuzzy_shot_quality(
+            abs(fire_heading_err), angle_limit, bullet_t, fire_dist, stable
         )
+        
+        good_shot = (intercept is not None and shot_q >= FIRE_Q_GOOD_SHOT)
 
-        cleanup_fire_override = False
-        if (
+        cleanup_shot_ready = (
             mode == "cleanup"
             and not rear_interrupt
             and intercept is not None
             and self._fire_cooldown == 0
-            and bullet_t < min(MAX_BULLET_TIME, 1.25)
-            and fire_dist < 800
-        ):
-            cleanup_angle_limit = max(angle_limit + 2.2, angle_limit * 1.55, 4.0)
-            if abs(fire_heading_err) < cleanup_angle_limit:
-                fire = True
-                cleanup_fire_override = True
+            and stable
+            and bullet_t < min(MAX_BULLET_TIME, 0.95)
+            and abs(fire_heading_err) < cleanup_fire_limit
+            and fire_dist < 700
+        )
 
-        # More permissive combat override: if we are under pressure, allow shots while retreating/backing up
-        # as long as the line is still reasonably good.
-        if (
-            intercept is not None
-            and self._fire_cooldown == 0
-            and danger_level > 0.35
-            and bullet_t < min(MAX_BULLET_TIME, 1.35)
-            and abs(fire_heading_err) < max(angle_limit * 1.35, angle_limit + 2.0)
-            and fire_dist < 720
-        ):
-            fire = True
+        if cleanup_shot_ready:
+            self._good_aim_frames = AIM_STABLE_REQUIRED
+        elif intercept is not None and bullet_t < MAX_BULLET_TIME and abs(fire_heading_err) < aim_build_limit and stable:
+            self._good_aim_frames += 1
+        else:
+            self._good_aim_frames = 0
+
+        fire = False
         fire_block_reasons = []
 
-        if rear_interrupt and rear_interrupt_threat is not None:
-            # Do not tunnel-vision on a front shot while something from the rear/side is about to collapse on us.
-            if rear_interrupt_threat["direction"] == "rear":
-                fire = False
-                fire_block_reasons.append("rear_interrupt")
+        can_fire_basic = (
+            intercept is not None
+            and self._fire_cooldown == 0
+        )
 
-        if danger_level > 0.7 and fire_dist < 200 and abs(fire_heading_err) < (angle_limit + 3.0):
-            fire = fire or (intercept is not None and bullet_t < MAX_BULLET_TIME)
+        rear_blocked = (
+            rear_interrupt
+            and rear_interrupt_threat is not None
+            and rear_interrupt_threat["direction"] == "rear"
+        )
+        if rear_blocked:
+            fire_block_reasons.append("rear_interrupt")
 
-        if target_size <= 1 and fire_dist > 260 and abs(fire_heading_err) > 4.0:
-            fire = False
+        small_target_blocked = (
+            mode != "cleanup"
+            and target_size <= 1
+            and fire_dist > 320
+            and abs(fire_heading_err) > 5.5
+        )
+        if small_target_blocked:
             fire_block_reasons.append("small_target_guard")
 
-        if intercept is None:
-            fire_block_reasons.append("no_intercept")
-        if self._fire_cooldown != 0:
-            fire_block_reasons.append(f"cooldown={self._fire_cooldown}")
-        if abs(fire_heading_err) >= angle_limit:
-            fire_block_reasons.append(f"err={abs(fire_heading_err):.2f}>lim={angle_limit:.2f}")
-        if bullet_t >= MAX_BULLET_TIME:
-            fire_block_reasons.append(f"bt={bullet_t:.2f}>max={MAX_BULLET_TIME:.2f}")
-        if not stable:
-            fire_block_reasons.append(f"unstable_turn(last={turn_rate_mag:.1f})")
-        if self._good_aim_frames < AIM_STABLE_REQUIRED:
-            fire_block_reasons.append(f"aim_frames={self._good_aim_frames}")
-        if fire_dist >= 950:
-            fire_block_reasons.append(f"dist={fire_dist:.1f}")
+        safe_retreat_blocked = False
+        target_threat = next((t for t in threats if t["asteroid"] is fire_target), None)
+        if target_threat is not None:
+            combined_r = target_threat["radius"] + SHIP_RADIUS
+            if (target_threat["closing_speed"] < -5.0
+                    and target_threat["closest_surface"] > combined_r * 6.0
+                    and target_threat["t_closest"] > 6.0
+                    and len(asteroids) > 1):
+                safe_retreat_blocked = True
+                fire_block_reasons.append(f"safe_retreat(miss={target_threat['closest_surface']:.0f})")
 
-        if cleanup_fire_override and fire:
-            fire_block_reasons.append("cleanup_override")
+        hard_blocked = rear_blocked or small_target_blocked or safe_retreat_blocked
+
+        # Fire decision: hard blocks first, then priority-ordered enable paths
+        if not hard_blocked and can_fire_basic:
+            
+            if cleanup_shot_ready:
+                fire = True
+
+            elif (danger_level > 0.7
+                    and fire_dist < 200
+                    and abs(fire_heading_err) < (angle_limit + 3.0)
+                    and bullet_t < MAX_BULLET_TIME):
+                fire = True
+
+            elif (self._good_aim_frames >= AIM_STABLE_REQUIRED
+                    and abs(fire_heading_err) < angle_limit
+                    and shot_q >= FIRE_Q_STANDARD):
+                fire = True
+
+            elif (mode == "engage"
+                    and not rear_interrupt
+                    and stable
+                    and bullet_t < min(MAX_BULLET_TIME, 0.95)
+                    and abs(fire_heading_err) < shot_good_limit
+                    and fire_dist < 620
+                    and danger_level < 0.60
+                    and shot_q >= FIRE_Q_ENGAGE):
+                fire = True
+
+            elif (danger_level > 0.35
+                    and bullet_t < min(MAX_BULLET_TIME, 1.35)
+                    and abs(fire_heading_err) < max(angle_limit * 1.35, angle_limit + 2.0)
+                    and fire_dist < 720
+                    and shot_q >= FIRE_Q_PRESSURE):
+                fire = True
+
+        if not fire and not hard_blocked:
+            
+            if intercept is None:
+                fire_block_reasons.append("no_intercept")
+            if self._fire_cooldown != 0:
+                fire_block_reasons.append(f"cooldown={self._fire_cooldown}")
+            if abs(fire_heading_err) >= angle_limit:
+                fire_block_reasons.append(f"err={abs(fire_heading_err):.2f}>lim={angle_limit:.2f}")
+            if bullet_t >= MAX_BULLET_TIME:
+                fire_block_reasons.append(f"bt={bullet_t:.2f}>max={MAX_BULLET_TIME:.2f}")
+            if not stable:
+                fire_block_reasons.append(f"unstable_turn(last={turn_rate_mag:.1f})")
+            if self._good_aim_frames < AIM_STABLE_REQUIRED:
+                fire_block_reasons.append(f"aim_frames={self._good_aim_frames}")
+            if shot_q < 0.35:
+                fire_block_reasons.append(f"shot_q={shot_q:.2f}")
+            if fire_dist >= 950:
+                fire_block_reasons.append(f"dist={fire_dist:.1f}")
 
         if fire:
             self._fire_cooldown = FIRE_COOLDOWN_FRAMES
             self._good_aim_frames = 0
+            
+            if FIRE_COOLDOWN_FRAMES > 0:
+                self._integral_error = 0.0
 
-        # --- SMOOTH EVASION ---
-        # Determine if we have a good shot (to possibly override evasion)
-        good_shot = (intercept is not None and abs(fire_heading_err) < angle_limit * (1.5 if mode == "cleanup" else 1.2) and fire_dist < (800 if mode == "cleanup" else 600))
-
-        # Compute raw potential field force
+        # Phase C: smooth evasion via potential field
         fx, fy = potential_field_force((sx, sy), (svx, svy), asteroids, map_size)
 
-        # If force is negligible, use default aim direction
         if abs(fx) < 1e-6 and abs(fy) < 1e-6:
             raw_escape_deg = desired_heading
         else:
             raw_escape_deg = math.degrees(math.atan2(fy, fx))
 
-        # Smooth the escape direction over time (low-pass filter)
         if self._smoothed_escape_deg is None:
             self._smoothed_escape_deg = raw_escape_deg
         else:
             diff = wrap180(raw_escape_deg - self._smoothed_escape_deg)
             self._smoothed_escape_deg = wrap180(self._smoothed_escape_deg + ESCAPE_SMOOTHING * diff)
 
-        # Check for emergency proximity
         min_dist_to_any = min(
             (toro_dist(sx, sy, a.position[0], a.position[1], map_size) - getattr(a, "radius", 0) - SHIP_RADIUS)
             for a in asteroids
         )
         emergency = min_dist_to_any < MIN_EVASION_DIST
 
-        # Threat / momentum checks
         threat_ahead = abs(wrap180(math.degrees(math.atan2(dy, dx)) - heading)) < 75.0
         closing_into_threat = projected_speed_toward((svx, svy), dx, dy)
         rear_is_clear = rear_clearance((sx, sy), heading, asteroids, map_size)
         front_is_clear = forward_clearance((sx, sy), heading, asteroids, map_size)
 
-        # Movement decision (Phase C): use action scoring over the top threats.
+        # Phase D: pick the best movement action
         _, target_angle, base_thrust = self._choose_movement_action(
             (sx, sy),
             (svx, svy),
@@ -1020,27 +1179,22 @@ class hybrid_controller_v2(KesslerController):
             mode,
             top_threats,
             rear_interrupt,
+            target_pos=fire_target.position,
+            target_vel=target_vel,
         )
 
-        # Compute heading error to target_angle
         err = wrap180(target_angle - heading)
 
-        # Adaptive thrust: soften forward motion on large turns, but do not kill it completely.
-        # Keep reverse thrust mostly intact so braking/backing out still works.
-        if abs(err) > TURN_FIRST_THRESH:
-            if base_thrust > 0:
-                thrust = base_thrust * 0.45
-            elif base_thrust < 0:
-                thrust = base_thrust * 0.90
-            else:
-                thrust = 0.0
+        if base_thrust > 0:
+            thrust = base_thrust * fuzzy_thrust_scale(abs(err))
+        elif base_thrust < 0:
+            
+            thrust = base_thrust * max(0.85, _falling(abs(err), 20.0, 60.0))
         else:
-            thrust = base_thrust
+            thrust = 0.0
 
-        # Compute turn rate (proportional, with a max)
-        turn_rate = max(-180.0, min(180.0, err * TURN_GAIN))
+        turn_rate = max(-180.0, min(180.0, err * TURN_GAIN + self._integral_error * self._integral_gain))
 
-        # Clamp to ship limits
         if hasattr(ship_state, "thrust_range"):
             lo, hi = ship_state.thrust_range
             thrust = max(lo, min(hi, thrust))
@@ -1080,4 +1234,4 @@ class hybrid_controller_v2(KesslerController):
 
     @property
     def name(self) -> str:
-        return "HybridFuzzyController PhaseC ThreatSearch AimPatch"
+        return "HybridFuzzyController PhaseC ThreatSearch"
