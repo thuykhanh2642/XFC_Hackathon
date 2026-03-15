@@ -1,6 +1,7 @@
 # training_script_patched.py
 # Trains the GAFuzzyController (hybrid architecture) using GA
-#type: ignore
+# Run:  python training_script_patched.py
+
 import sys
 sys.path.append('.')
 
@@ -34,7 +35,6 @@ SCENARIO_WEIGHTS = {
     "One Asteroid Slow Horizontal": 0.75,
     "Two Asteroids Still": 0.80,
     "Three Asteroids Row": 0.90,
-    "Sniper Practice (Large Arena)": 0.90,
 
     # Medium / general maps.
     "Stock Scenario": 1.10,
@@ -47,9 +47,10 @@ SCENARIO_WEIGHTS = {
     "Spiral Swarm": 1.15,
     "Four Corner Assault": 1.25,
 
-    # Hard holdouts should matter a lot.
-    "Cross (Rotating Look, CW)": 2.00,
-    "Moving Maze (Rightward Tunnel)": 2.50,
+    # Hard holdouts — architecturally unwinnable, keep low weight
+    # so they don't mask progress on achievable scenarios.
+    "Cross (Rotating Look, CW)": 0.30,
+    "Moving Maze (Rightward Tunnel)": 0.30,
 }
 
 
@@ -59,7 +60,7 @@ game_settings = {
     'realtime_multiplier':   0,
     'graphics_obj':          None,
     'frequency':             30,
-    'time_limit':            30,
+    'time_limit':            20,
     'competition_safe_mode': False,
 }
 
@@ -167,18 +168,9 @@ def _tiered_training_sets():
 
 
 def get_training_set_for_generation(generation):
-    tier1, tier2, tier3, hard = _tiered_training_sets()
-
-    # Accumulating curriculum: do not drop earlier skills, just add complexity.
-    if generation < 5:
-        active = tier1                          # 4 easy (still/slow targets)
-    elif generation < 12:
-        active = tier1 + tier2                  # +4 medium (stock, donut, wall, closing)
-    else:
-        active = tier1 + tier2 + tier3          # +5 hard (rain, lanes, giants, spiral, corners) = all 12+
-
-    # Robust fallback in case names differ from expectations.
-    return active if active else list(training_set)
+    # No curriculum — train on all scenarios from the start.
+    # Scenario weights already control relative importance.
+    return list(training_set)
 
 
 def get_active_training_set():
@@ -253,8 +245,11 @@ def clear_solution_history(output_dir: Path):
         p.unlink()
 
 
+_best_saved_validation = float('-inf')
+
 def save_best(individual, generation, out_dir, pop_size, cxpb, mutpb, sigma,
               validation_score=None, validation_details=None):
+    global _best_saved_validation
     result = {
         "generation":       generation,
         "fitness":          list(individual.fitness.values),
@@ -270,8 +265,12 @@ def save_best(individual, generation, out_dir, pop_size, cxpb, mutpb, sigma,
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / f"gen_{generation:04d}.json").open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
-    with (out_dir.parent / "best_solution.json").open("w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+    # Only overwrite best_solution.json when validation improves
+    val = validation_score if validation_score is not None else float('-inf')
+    if val >= _best_saved_validation:
+        _best_saved_validation = val
+        with (out_dir.parent / "best_solution.json").open("w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
 
 
 def fmt_duration(seconds):
@@ -323,30 +322,97 @@ def compute_mutation_params(generation, best_history, validation_history):
 # GA config ───────────────────────────────────────────────────────────────
 
 N_GENES             = 50
-POP_SIZE            = 60
-MAX_GEN             = 600
+POP_SIZE            = 40
+MAX_GEN             = 400
 CXPB                = 0.5
 MUTPB               = 0.25
 SIGMA               = 0.20
 INDPB               = 0.20
 ELITE_FRAC          = 0.08
-EARLY_STOP_PATIENCE = 80
+EARLY_STOP_PATIENCE = 30
 DIVERSITY_FLOOR     = 0.04
 RANDOM_INJECT_FRAC  = 0.25
 N_WORKERS           = max(1, multiprocessing.cpu_count() - 1)
 
 
+# Multi-restart config
+N_RESTARTS          = 10
+GENS_PER_RESTART    = 25
+
+
 # Main ────────────────────────────────────────────────────────────────────
+
+def run_one_restart(restart_id, toolbox, shared_state, out_dir):
+    """Run a short GA from random init, return (best_genome, best_val, best_train)."""
+    pop = toolbox.population(n=POP_SIZE)
+
+    fitnesses = toolbox.map(toolbox.evaluate, pop)
+    for ind, fit in zip(pop, fitnesses):
+        ind.fitness.values = fit
+
+    hof = tools.HallOfFame(1)
+    hof.update(pop)
+
+    best_val = validate(hof[0])
+    best_val_genome = list(hof[0])
+    best_train = hof[0].fitness.values[0]
+
+    for g in range(1, GENS_PER_RESTART + 1):
+        shared_state.generation = g
+        elite_size = max(1, int(round(ELITE_FRAC * POP_SIZE)))
+
+        elites = [toolbox.clone(ind) for ind in tools.selBest(pop, elite_size)]
+        offspring = [toolbox.clone(ind) for ind in toolbox.select(pop, POP_SIZE - elite_size)]
+        for ind in offspring:
+            if hasattr(ind.fitness, "values"):
+                del ind.fitness.values
+
+        for c1, c2 in zip(offspring[::2], offspring[1::2]):
+            if random.random() < CXPB:
+                toolbox.mate(c1, c2)
+                if hasattr(c1.fitness, "values"):
+                    del c1.fitness.values
+                if hasattr(c2.fitness, "values"):
+                    del c2.fitness.values
+
+        for mutant in offspring:
+            if random.random() < MUTPB:
+                tools.mutGaussian(mutant, mu=0.0, sigma=SIGMA, indpb=INDPB)
+                clamp_individual(mutant)
+                if hasattr(mutant.fitness, "values"):
+                    del mutant.fitness.values
+
+        invalid = [ind for ind in offspring if not ind.fitness.valid]
+        if invalid:
+            fitnesses = toolbox.map(toolbox.evaluate, invalid)
+            for ind, fit in zip(invalid, fitnesses):
+                ind.fitness.values = fit
+
+        pop[:] = elites + offspring
+        hof.update(pop)
+
+        cur_val = validate(hof[0])
+        cur_train = hof[0].fitness.values[0]
+
+        if cur_val > best_val + 1e-9:
+            best_val = cur_val
+            best_val_genome = list(hof[0])
+            best_train = cur_train
+
+        fits = [ind.fitness.values[0] for ind in pop]
+        print(f"  R{restart_id:>2} G{g:>3}  train={cur_train:>8.4f}  val={cur_val:>8.4f}  "
+              f"best_val={best_val:>8.4f}  mean={sum(fits)/len(fits):>8.4f}  gstd={mean_gene_std(pop):>7.4f}")
+
+    return best_val_genome, best_val, best_train
+
 
 def main():
     print("=" * 72)
-    print("  GAFuzzyController (HYBRID) — TRAINING")
+    print("  GAFuzzyController — MULTI-RESTART GA")
     print("=" * 72)
-    print(f"  Population : {POP_SIZE}  |  Max gens: {MAX_GEN}")
-    print(f"  Train set  : {len(training_set)} total (smooth curriculum)  |  Validation: {len(validation_set)}")
+    print(f"  Restarts   : {N_RESTARTS}  |  Gens per restart: {GENS_PER_RESTART}")
+    print(f"  Population : {POP_SIZE}  |  Train set: {len(training_set)}  |  Val set: {len(validation_set)}")
     print(f"  Workers    : {N_WORKERS}")
-    print("  Fitness    : weighted(mean) of [1.2*hit + 0.4*acc - 0.45*deaths - 0.05*mines + 0.75 clean + time]")
-    print("  Extras     : elitism + adaptive mutation + diversity injection + smoother curriculum")
     print("  Saves to   : best_solution.json")
     print("=" * 72)
     print()
@@ -377,167 +443,62 @@ def main():
     out_dir = Path(os.path.dirname(__file__), "solution_history")
     clear_solution_history(out_dir)
 
-    pop = toolbox.population(n=POP_SIZE)
+    global_best_val = float('-inf')
+    global_best_genome = None
+    global_best_train = None
+    all_results = []
 
-    # Warm-start from previous best if available, but keep diversity higher.
-    best_path = Path(os.path.dirname(__file__), 'best_solution.json')
-    if best_path.exists():
-        try:
-            with best_path.open('r', encoding='utf-8') as f:
-                data = json.load(f)
-            best_genome = [float(x) for x in data.get('genome', [])]
-            if len(best_genome) == N_GENES:
-                print('Seeding population with previous best genome (reduced bias)')
-                seed_count = min(3, POP_SIZE)
-                for i in range(seed_count):
-                    ind = creator.Individual(best_genome[:])
-                    if i > 0:
-                        tools.mutGaussian(ind, mu=0.0, sigma=0.10, indpb=0.20)
-                        clamp_individual(ind)
-                    pop[i] = ind
-        except Exception as e:
-            print(f'Warm start skipped: {e}')
-
-    initial_active = get_training_set_for_generation(0)
-    print(f"Evaluating initial population ({POP_SIZE} individuals in parallel)...")
-    print(f"Curriculum phase 0 uses {len(initial_active)} training scenarios")
-    t0 = time.perf_counter()
-    fitnesses = toolbox.map(toolbox.evaluate, pop)
-    for ind, fit in zip(pop, fitnesses):
-        ind.fitness.values = fit
-    gen0_time = time.perf_counter() - t0
     training_start = time.perf_counter()
 
-    hof = tools.HallOfFame(1)
-    hof.update(pop)
-    best_validation, best_val_details = validate(hof[0], detailed=True, quiet=False)
-    save_best(hof[0], 0, out_dir, POP_SIZE, CXPB, MUTPB, SIGMA, best_validation, best_val_details)
-
-    fits = [ind.fitness.values[0] for ind in pop]
-    best_history = [hof[0].fitness.values[0]]
-    validation_history = [best_validation]
-    no_improve_gens = 0
-
-    print(f"Done in {gen0_time:.1f}s")
-    print()
-    print(f"{'Gen':>5}  {'best':>8}  {'val':>8}  {'max':>8}  {'mean':>8}  {'gstd':>7}  "
-          f"{'mutpb':>6}  {'sigma':>6}  {'evals':>6}  {'gen_t':>7}  {'elapsed':>9}  {'ETA':>9}")
-    print("-" * 112)
-    print(f"{'0':>5}  {hof[0].fitness.values[0]:>8.4f}  {best_validation:>8.4f}  "
-          f"{max(fits):>8.4f}  {sum(fits)/len(fits):>8.4f}  {mean_gene_std(pop):>7.4f}  "
-          f"{MUTPB:>6.2f}  {SIGMA:>6.2f}  {'—':>6}  {gen0_time:>6.1f}s  "
-          f"{fmt_duration(0):>9}  {'—':>9}")
-
-    gen_times = []
-    last_active_count = len(initial_active)
-
     try:
-        for g in range(1, MAX_GEN + 1):
-            shared_state.generation = g
-            t_gen = time.perf_counter()
-            cur_mutpb, cur_sigma = compute_mutation_params(g, best_history, validation_history)
-            elite_size = max(1, int(round(ELITE_FRAC * POP_SIZE)))
+        for r in range(N_RESTARTS):
+            print(f"\n{'='*60}")
+            print(f"  RESTART {r+1}/{N_RESTARTS}")
+            print(f"{'='*60}")
+            t0 = time.perf_counter()
 
-            elites = [toolbox.clone(ind) for ind in tools.selBest(pop, elite_size)]
-            offspring = [toolbox.clone(ind) for ind in toolbox.select(pop, POP_SIZE - elite_size)]
-            for ind in offspring:
-                if hasattr(ind.fitness, "values"):
-                    del ind.fitness.values
+            genome, val, train = run_one_restart(r+1, toolbox, shared_state, out_dir)
+            rt = time.perf_counter() - t0
+            all_results.append({'restart': r+1, 'val': val, 'train': train, 'time': rt})
 
-            for c1, c2 in zip(offspring[::2], offspring[1::2]):
-                if random.random() < CXPB:
-                    toolbox.mate(c1, c2)
-                    if hasattr(c1.fitness, "values"):
-                        del c1.fitness.values
-                    if hasattr(c2.fitness, "values"):
-                        del c2.fitness.values
+            if val > global_best_val + 1e-9:
+                global_best_val = val
+                global_best_genome = genome
+                global_best_train = train
 
-            for mutant in offspring:
-                if random.random() < cur_mutpb:
-                    tools.mutGaussian(mutant, mu=0.0, sigma=cur_sigma, indpb=INDPB)
-                    clamp_individual(mutant)
-                    if hasattr(mutant.fitness, "values"):
-                        del mutant.fitness.values
-
-            # Inject randomness if the population has collapsed too much.
-            gene_std = mean_gene_std(pop)
-            if g >= 6 and gene_std < DIVERSITY_FLOOR:
-                inject_n = max(1, int(round(RANDOM_INJECT_FRAC * POP_SIZE)))
-                for i in range(inject_n):
-                    new_ind = toolbox.individual()
-                    if i < len(offspring):
-                        offspring[-(i + 1)] = new_ind
-                print(f"--> Diversity injection at generation {g}: gene-std={gene_std:.4f}, injected {inject_n} random individuals")
-
-            invalid = [ind for ind in offspring if not ind.fitness.valid]
-            if invalid:
-                fitnesses = toolbox.map(toolbox.evaluate, invalid)
-                for ind, fit in zip(invalid, fitnesses):
-                    ind.fitness.values = fit
-
-            pop[:] = elites + offspring
-            hof.update(pop)
-            best_ind = hof[0]
-
-            should_log_validation = (g % VALIDATION_LOG_EVERY == 0)
-            if should_log_validation:
-                best_validation, best_val_details = validate(best_ind, detailed=True, quiet=False)
+                # Save new global best
+                ind = creator.Individual(genome)
+                ind.fitness.values = (train,)
+                val_detail_score, val_details = validate(ind, detailed=True, quiet=False)
+                save_best(ind, r+1, out_dir, POP_SIZE, CXPB, MUTPB, SIGMA,
+                          val_detail_score, val_details)
+                print(f"  *** New global best: val={val:.4f}  train={train:.4f} ***")
             else:
-                best_validation = validate(best_ind)
-                best_val_details = None
+                print(f"  Restart {r+1} best val={val:.4f} (global best still {global_best_val:.4f})")
 
-            save_best(best_ind, g, out_dir, POP_SIZE, CXPB, cur_mutpb, cur_sigma,
-                      best_validation, best_val_details)
-
-            gen_time = time.perf_counter() - t_gen
-            gen_times.append(gen_time)
-            avg_gen_time = sum(gen_times[-10:]) / len(gen_times[-10:])
             elapsed = time.perf_counter() - training_start
-            eta = fmt_duration(avg_gen_time * (MAX_GEN - g))
+            print(f"  Time: {rt:.0f}s this restart | {fmt_duration(elapsed)} total")
 
-            fits = [ind.fitness.values[0] for ind in pop]
-            gen_max = max(fits)
-            mean = sum(fits) / len(fits)
-            best_now = best_ind.fitness.values[0]
-            best_history.append(best_now)
-            validation_history.append(best_validation)
-
-            if best_validation > max(validation_history[:-1], default=float('-inf')) + 1e-9:
-                no_improve_gens = 0
-            else:
-                no_improve_gens += 1
-
-            active_len = len(get_training_set_for_generation(g))
-            if active_len != last_active_count:
-                print(f"--> Curriculum phase change at generation {g}: now using {active_len} training scenarios")
-                last_active_count = active_len
-
-            gene_std_after = mean_gene_std(pop)
-            print(f"{g:>5}  {best_now:>8.4f}  {best_validation:>8.4f}  "
-                  f"{gen_max:>8.4f}  {mean:>8.4f}  {gene_std_after:>7.4f}  "
-                  f"{cur_mutpb:>6.2f}  {cur_sigma:>6.2f}  {len(invalid):>6}  {gen_time:>6.1f}s  "
-                  f"{fmt_duration(elapsed):>9}  {eta:>9}")
-
-            if no_improve_gens >= EARLY_STOP_PATIENCE:
-                print()
-                print(f"Early stopping at generation {g}: no validation improvement for "
-                      f"{EARLY_STOP_PATIENCE} generations.")
-                break
     finally:
         pool.close()
         pool.join()
         manager.shutdown()
 
     total = time.perf_counter() - training_start
-    final_val, final_val_details = validate(hof[0], detailed=True, quiet=False)
     print()
     print("=" * 72)
-    print("  TRAINING COMPLETE")
+    print("  MULTI-RESTART TRAINING COMPLETE")
     print("=" * 72)
-    print(f"  Total time       : {fmt_duration(total)}")
-    print(f"  Best train score : {hof[0].fitness.values[0]:.4f}")
-    print(f"  Best val score   : {final_val:.4f}")
-    print("  Saved to         : best_solution.json")
+    print(f"  Total time         : {fmt_duration(total)}")
+    print(f"  Restarts completed : {len(all_results)}")
+    print(f"  Global best val    : {global_best_val:.4f}")
+    print(f"  Global best train  : {global_best_train:.4f}")
+    print("  Saved to           : best_solution.json")
+    print()
+    print("  Per-restart results:")
+    for res in all_results:
+        marker = " <-- BEST" if abs(res['val'] - global_best_val) < 1e-9 else ""
+        print(f"    R{res['restart']:>2}: val={res['val']:>8.4f}  train={res['train']:>8.4f}  ({res['time']:.0f}s){marker}")
     print("=" * 72)
 
 

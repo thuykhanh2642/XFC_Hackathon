@@ -268,8 +268,22 @@ class GAFuzzyController(KesslerController):
     def _pick_target(self, tti_cap):
         # Keep current target briefly to avoid wrap/intercept jitter.
         if self._target_lock_timer > 0 and self._target_lock is not None:
-            self._target_lock_timer -= 1
-            return self._target_lock
+            # Validate the locked target still exists (match by position proximity).
+            lock_pos = self._target_lock.position
+            refreshed = None
+            for ast in self.sa.ownship.asteroids:
+                dx = ast.position[0] - lock_pos[0]
+                dy = ast.position[1] - lock_pos[1]
+                if dx * dx + dy * dy < 2500:  # within ~50px
+                    refreshed = ast
+                    break
+            if refreshed is not None:
+                self._target_lock = refreshed
+                self._target_lock_timer -= 1
+                return refreshed
+            # Target destroyed — fall through to pick a new one.
+            self._target_lock = None
+            self._target_lock_timer = 0
 
         n = min(self._n_candidates, len(self.sa.ownship.asteroids))
         candidates = self.sa.ownship.nearest_n_wrap(n)
@@ -338,10 +352,17 @@ class GAFuzzyController(KesslerController):
         )
         turn_rate = float(np.clip(norm_turn * MAX_TURN, -MAX_TURN, MAX_TURN))
 
+        # --- FIX: sign sanity check ---
+        # If the FIS says turn away from target when error is large, override
+        # with a simple proportional controller (correct direction).
         abs_err = abs(angle_error)
         if abs_err > 8.0 and turn_rate * angle_error < 0:
             turn_rate = float(np.sign(angle_error)) * min(abs_err * 2.0, MAX_TURN)
 
+        # --- FIX: proportional damping to prevent overshoot ---
+        # Limit turn rate so the ship can't overshoot the target in one frame.
+        # At 30 Hz, turning X deg/s moves X/30 deg per frame.
+        # Cap turn rate so per-frame movement is at most 70% of remaining error.
         if abs_err > 0.1:
             max_rate_for_error = abs_err * 0.70 * 30.0   # 70% of error per frame × fps
             turn_rate = float(np.clip(turn_rate, -max_rate_for_error, max_rate_for_error))
@@ -422,10 +443,16 @@ class GAFuzzyController(KesslerController):
             and norm_bullet_t < 0.85
         )
 
+        # Loosen fire gate for stationary/slow targets — intercept is exact,
+        # no reason to restrict bullet time.
         stationary_like_target = (
             best_target is not None
             and math.hypot(best_target.velocity[0], best_target.velocity[1]) < 20.0
         )
+        if not fire and stationary_like_target and intercept is not None:
+            if abs(angle_error) < self._fire_threshold:
+                fire = True  # allow any range for stationary targets
+
         if stationary_like_target and intercept is not None and norm_bullet_t < 0.50:
             if abs(angle_error) < max(2.0, 0.5 * self._fire_threshold):
                 turn_rate = 0.0
@@ -433,6 +460,25 @@ class GAFuzzyController(KesslerController):
 
         if fire and abs(angle_error) < max(1.0, 0.35 * self._fire_threshold):
             turn_rate = 0.0
+
+        # --- FLEE MODE ---
+        # When overwhelmed (multiple imminent impacters), abandon aiming
+        # and thrust away from the centroid of threats.
+        flee_threshold = 0.3 + self.chromosome[39] * 1.2  # gene 39: flee TTI threshold
+        flee_count = sum(
+            1 for ast in impacters
+            if ast.tti is not None and ast.tti < flee_threshold
+        )
+        if flee_count >= 2:
+            sx, sy = self.sa.ownship.position
+            cx_threat = sum(a.position_wrap[0] for a in impacters[:flee_count]) / flee_count
+            cy_threat = sum(a.position_wrap[1] for a in impacters[:flee_count]) / flee_count
+            away_x, away_y = _safe_unit(sx - cx_threat, sy - cy_threat)
+            h_rad = math.radians(self.sa.ownship.heading)
+            ship_fwd = (math.sin(h_rad), -math.cos(h_rad))
+            dot = ship_fwd[0] * away_x + ship_fwd[1] * away_y
+            thrust = math.copysign(self._thrust_hard, dot)
+            # Don't zero turn_rate — keep aiming while fleeing
 
         drop_mine = bool(self.should_drop_mine(
             closest_tti=closest_tti,

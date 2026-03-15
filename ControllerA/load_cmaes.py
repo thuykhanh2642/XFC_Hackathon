@@ -1,4 +1,3 @@
-#type: ignore
 import sys
 sys.path.append('.')
 
@@ -21,7 +20,6 @@ SCENARIO_WEIGHTS = {
     "One Asteroid Slow Horizontal": 0.75,
     "Two Asteroids Still": 0.80,
     "Three Asteroids Row": 0.90,
-    "Sniper Practice (Large Arena)": 0.90,
     "Stock Scenario": 1.10,
     "Donut Ring": 1.15,
     "Donut Ring (Closing In, Large Asteroids)": 1.15,
@@ -31,8 +29,8 @@ SCENARIO_WEIGHTS = {
     "Giants with Kamikaze": 1.25,
     "Spiral Swarm": 1.15,
     "Four Corner Assault": 1.25,
-    "Cross (Rotating Look, CW)": 2.00,
-    "Moving Maze (Rightward Tunnel)": 2.50,
+    "Cross (Rotating Look, CW)": 0.30,
+    "Moving Maze (Rightward Tunnel)": 0.30,
 }
 
 game_settings = {

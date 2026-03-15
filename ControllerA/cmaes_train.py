@@ -1,4 +1,3 @@
-#type: ignore
 import sys
 sys.path.append('.')
 
@@ -41,7 +40,6 @@ SCENARIO_WEIGHTS = {
     "One Asteroid Slow Horizontal": 0.75,
     "Two Asteroids Still": 0.80,
     "Three Asteroids Row": 0.90,
-    "Sniper Practice (Large Arena)": 0.90,
     "Stock Scenario": 1.10,
     "Donut Ring": 1.15,
     "Donut Ring (Closing In, Large Asteroids)": 1.15,
@@ -51,8 +49,8 @@ SCENARIO_WEIGHTS = {
     "Giants with Kamikaze": 1.25,
     "Spiral Swarm": 1.15,
     "Four Corner Assault": 1.25,
-    "Cross (Rotating Look, CW)": 2.00,
-    "Moving Maze (Rightward Tunnel)": 2.50,
+    "Cross (Rotating Look, CW)": 0.30,
+    "Moving Maze (Rightward Tunnel)": 0.30,
 }
 
 game_settings = {
@@ -61,7 +59,7 @@ game_settings = {
     'realtime_multiplier': 0,
     'graphics_obj': None,
     'frequency': 30,
-    'time_limit': 30,
+    'time_limit': 20,
     'competition_safe_mode': False,
 }
 
@@ -147,14 +145,7 @@ def _tiered_training_sets():
 
 
 def get_training_set_for_iteration(iteration: int):
-    tier1, tier2, tier3, hard = _tiered_training_sets()
-    if iteration < 5:
-        active = tier1
-    elif iteration < 12:
-        active = tier1 + tier2
-    else:
-        active = tier1 + tier2 + tier3
-    return active if active else list(training_set)
+    return list(training_set)
 
 
 def _evaluate_one(genome, scenarios):

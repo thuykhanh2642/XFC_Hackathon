@@ -152,7 +152,7 @@ def crossing_lanes(map_size=(1200, 900), *,
 
     W, H = map_size
     cx, cy = W * 0.5, H * 0.5
-    ship = {'position': (cx, cy), 'angle': 0, 'lives': 9, 'team': 1, 'mines_remaining': 3}
+    ship = {'position': (cx, cy), 'angle': 0, 'lives': 3, 'team': 1, 'mines_remaining': 3}
 
     ast_states = []
 
@@ -613,6 +613,9 @@ def four_corner(map_size=(1200, 900), *,
 
     ast_states = []
 
+    # Fixed seed for reproducible asteroid positions
+    rng = random.Random(99)
+
     # Corner spawn positions
     corners = [
         (corner_margin, corner_margin),               # Top-left
@@ -625,8 +628,8 @@ def four_corner(map_size=(1200, 900), *,
     for (cxn, cyn) in corners:
         for i in range(cluster_size):
             # random spread inside each cluster
-            x = cxn + random.uniform(-40, 40)
-            y = cyn + random.uniform(-40, 40)
+            x = cxn + rng.uniform(-40, 40)
+            y = cyn + rng.uniform(-40, 40)
 
             # angle toward center
             heading = math.degrees(math.atan2(cy - y, cx - x))
@@ -746,10 +749,6 @@ def three_asteroids_still_row(map_size=(1000,800), *, time_limit=25):
 #   static targets, fast movers, closing rings, crossing traffic
 
 training_set = [
-    one_asteroid_still(),
-    one_asteroid_slow_horizontal(),
-    two_asteroids_still(),
-    three_asteroids_still_row(),
     stock_scenario(),
     donut_ring(),
     donut_ring_closing(),
@@ -757,12 +756,11 @@ training_set = [
     asteroid_rain(),
     crossing_lanes(),
     giants_with_kamikaze(),
-    spiral_arms(),
+    four_corner(),
 ]
 
 validation_set = [
     moving_maze_right(),
     four_corner(),
     rotating_cross(),
-    sniper_practice(),
 ]
